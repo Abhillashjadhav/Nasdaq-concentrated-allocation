@@ -104,6 +104,11 @@ class PITStore:
                 params=(field, ticker, cutoff),
                 parse_dates=["event_date", "knowledge_date"],
             )
+        # Pandera guard on the READ boundary too (ARCHITECTURE.md §8): anything
+        # leaving the store satisfies the universal record schema. Empty results
+        # are a valid (no qualifying rows) answer, not a schema violation.
+        if not df.empty:
+            df = validate(df)
         return df
 
 
