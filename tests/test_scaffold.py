@@ -43,13 +43,13 @@ def test_get_data_is_the_chokepoint():
 def test_stubs_raise_not_implemented():
     """Not-yet-built stages must fail loud, not return a silent value.
 
-    (store, universe, signals, macro and the winner labeler are implemented in
-    their PRs; here we guard a stage still on the stub — the walk-forward runner,
-    PR 12.)
+    (the data, signal, macro, labeler, stats and walk-forward stages are
+    implemented in their PRs; here we guard the last stage still on the stub —
+    the report / GO-KILL verdict, PR 13.)
     """
-    backtest = importlib.import_module("backtest")
+    report = importlib.import_module("report")
     with pytest.raises(NotImplementedError):
-        backtest.run_walk_forward()
+        report.build_report()
 
 
 def test_orchestrator_cli_parses():
