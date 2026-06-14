@@ -23,6 +23,14 @@ Observations without a score (signal couldn't be computed) are likewise excluded
 ------------------
 ``fired = score >= threshold``. By default the threshold is the top-quantile cut
 (``fire_quantile=0.8`` → the top 20% of scores). It is documented and overridable.
+
+CI vs p-value answer slightly different questions
+-------------------------------------------------
+The bootstrap CI bounds the headline ``lift`` (fired arm vs the unconditional
+*base rate*, §3), while the p-value tests the fired arm vs the *not-fired* arm
+(two independent proportions). Both are reported; do not expect the CI's
+zero-exclusion to mirror the p-value threshold exactly — they measure related but
+distinct contrasts.
 """
 
 from __future__ import annotations
