@@ -14,8 +14,10 @@ import pytest
 
 from evals.no_peek import assert_no_future_rows
 from signals.momentum import (
+    HIGH_52W_WINDOW,
     MIN_HISTORY,
     MOM_BAND,
+    PROX_BAND,
     SLOPE_BAND,
     TREND_BAND,
     WEIGHTS,
@@ -60,16 +62,18 @@ def _expected_score(p: np.ndarray) -> dict:
     sma_prev = (p[last - 21 - 199] + p[last - 21]) / 2  # mean of last 200, 21d ago
     trend = chron(0) / sma_now - 1.0
     slope = sma_now / sma_prev - 1.0
+    # monotonic ramp => max over the last 252 is one of the window endpoints
+    high = max(p[last - (HIGH_52W_WINDOW - 1)], p[last])
+    prox = chron(0) / high - 1.0
+    raw = {"mom_12_1": mom, "price_vs_sma200": trend, "sma200_slope": slope,
+           "high_52w_proximity": prox}
     sub = {
         "mom_12_1": _band(mom, *MOM_BAND),
         "price_vs_sma200": _band(trend, *TREND_BAND),
         "sma200_slope": _band(slope, *SLOPE_BAND),
+        "high_52w_proximity": _band(prox, *PROX_BAND),
     }
-    return {
-        "raw": {"mom_12_1": mom, "price_vs_sma200": trend, "sma200_slope": slope},
-        "score": sum(WEIGHTS[k] * sub[k] for k in WEIGHTS),
-        "sub": sub,
-    }
+    return {"raw": raw, "score": sum(WEIGHTS[k] * sub[k] for k in WEIGHTS), "sub": sub}
 
 
 def test_golden_case(tmp_path):
@@ -82,6 +86,28 @@ def test_golden_case(tmp_path):
     for k in WEIGHTS:
         assert res.components["subscores"][k] == pytest.approx(exp["sub"][k], abs=1e-9)
         assert res.components["raw"][k] == pytest.approx(exp["raw"][k], abs=1e-12)
+
+
+def test_golden_case_descending_exercises_proximity(tmp_path):
+    """A descending ramp keeps every window mean = (first+last)/2 but puts the
+    current price BELOW the 52-week high, so the proximity sub-score lands in its
+    interior (not the at-the-high boundary the ascending ramp produces)."""
+    prices = np.array([200.0 - 0.05 * k for k in range(N)])  # chronological, falling
+    s = PITStore(tmp_path / "down.sqlite")
+    s.put_data(
+        pd.DataFrame(
+            {"ticker": "DOWN", "field": "close", "value": prices,
+             "event_date": DATES, "knowledge_date": DATES, "source": "fixture"}
+        )
+    )
+    res = momentum_score("DOWN", DATES[-1], store=s)
+    exp = _expected_score(prices)
+
+    assert res.score == pytest.approx(exp["score"], abs=1e-9)
+    for k in WEIGHTS:
+        assert res.components["subscores"][k] == pytest.approx(exp["sub"][k], abs=1e-9)
+    # every sub-score is strictly interior here -> real band arithmetic, no clamps
+    assert all(0.0 < v < 100.0 for v in res.components["subscores"].values())
 
 
 def test_insufficient_history(tmp_path):
