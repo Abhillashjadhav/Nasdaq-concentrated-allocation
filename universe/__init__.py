@@ -5,15 +5,24 @@ merged, or bankrupt (ARCHITECTURE.md §2). Using today's survivors inflates
 returns 1–4%/yr and can reverse conclusions. Scope: Nasdaq Composite, healthcare
 + technology, all cap tiers, then a liquidity filter.
 
-Implemented in PR 4 (ARCHITECTURE.md §9).
+Implementation lives in ``universe.universe`` and reads only through
+``store.get_data`` (ARCHITECTURE.md §7, §9.4).
 """
 
 from __future__ import annotations
 
-from datetime import date
+from .universe import (
+    NullSectorClassifier,
+    SectorClassifier,
+    UniverseResult,
+    build_universe,
+    get_universe,
+)
 
-
-def get_universe(as_of: date) -> list[str]:
-    """Return the liquidity-filtered, survivorship-free ticker universe as it
-    stood on ``as_of`` — including names later delisted."""
-    raise NotImplementedError("Universe + liquidity filter land in PR 4")
+__all__ = [
+    "get_universe",
+    "build_universe",
+    "UniverseResult",
+    "SectorClassifier",
+    "NullSectorClassifier",
+]
