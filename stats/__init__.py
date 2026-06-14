@@ -1,22 +1,15 @@
-"""Two-arm statistics engine (ARCHITECTURE.md §2, §8).
+"""Two-arm statistics engine (ARCHITECTURE.md §2, §3, §8).
 
 The experiment: for each signal, P(winner | signal fired) vs the unconditional
 base rate, with same-signal losers explicitly counted. Computes conditional
-win-rate lift, confidence intervals, p-values, and rank-IC. A winners-only view
-is forbidden.
+win-rate lift, a bootstrap CI, a p-value, and rank-IC. A winners-only view is
+forbidden — the result always carries the base rate and both arms.
 
-Implemented in PR 11 with its calibration eval (ARCHITECTURE.md §9).
+Implementation lives in ``stats.two_arm``.
 """
 
 from __future__ import annotations
 
+from .two_arm import OBSERVATION_SCHEMA, TwoArmResult, two_arm_lift
 
-def two_arm_lift(*args, **kwargs):
-    """Return conditional win-rate lift over base rate, with the loser arm
-    counted, plus CI and p-value."""
-    raise NotImplementedError("Two-arm stats engine lands in PR 11")
-
-
-def rank_ic(*args, **kwargs):
-    """Rank information coefficient: composite score vs forward return."""
-    raise NotImplementedError("Rank-IC lands in PR 11")
+__all__ = ["two_arm_lift", "TwoArmResult", "OBSERVATION_SCHEMA"]
