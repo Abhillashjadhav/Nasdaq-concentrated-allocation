@@ -1,18 +1,14 @@
-"""Macro regime gate (ARCHITECTURE.md §4).
+"""Macro regime gate (ARCHITECTURE.md §4, §9.9).
 
 Risk-off -> cash when HY OAS widening AND Fed tightening hard AND VIX regime
-breaking. An AND gate: all conditions must fire. Reads only via
-``store.get_data``.
+breaking. An AND gate: all conditions must coincide. Reads only via
+``store.get_data``; fails safe to risk-off when macro inputs are missing.
 
-Implemented in PR 9 with its eval (ARCHITECTURE.md §9).
+Implementation lives in ``macro.regime``.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from .regime import RegimeState, macro_coverage_gaps, regime_state
 
-
-def regime(as_of: date) -> str:
-    """Return the macro regime as of ``as_of`` (e.g. ``"risk_on"`` /
-    ``"risk_off"``). Risk-off forces the book to cash."""
-    raise NotImplementedError("Macro gate + regime classification land in PR 9")
+__all__ = ["regime_state", "RegimeState", "macro_coverage_gaps"]
