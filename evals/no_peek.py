@@ -10,8 +10,6 @@ naming the exact ticker/field/knowledge_date/as_of — and the build fails.
 
 from __future__ import annotations
 
-from datetime import date
-
 import pandas as pd
 
 
