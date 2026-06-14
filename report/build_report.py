@@ -182,17 +182,20 @@ def _render(verdict, n_confirmed, verdicts, results, coverage_by_year, haircut_p
             f"| {v.mean_lift:+.3f} | {v.haircut_adjusted_lift:+.3f} | {v.mean_rank_ic:+.3f} "
             f"| {v.n_fired}/{v.n_not_fired} | {'ok' if v.sample_floor_met else 'LOW'} |"
         )
-        if v.reasons:
-            lines.append(f"|   ↳ blocked: {'; '.join(v.reasons)} |||||||| ")
+    blocked = [v for v in verdicts if v.reasons]
+    if blocked:
+        lines += ["", "**Why blocked:**"]
+        lines += [f"- {v.signal}: {'; '.join(v.reasons)}" for v in blocked]
 
-    lines += ["", "## Per-year detail"]
+    lines += ["", "## Per-year detail (two-arm: base rate vs both arms)"]
     for name, wf in results.items():
         lines.append(f"### {name}")
-        lines.append("| year | n | lift | CI | rank-IC | sig+ |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| year | n | base rate | P(win\\|fired) | P(win\\|not) | lift | CI | rank-IC | sig+ |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for s in wf.slices:
             lines.append(
-                f"| {s.year} | {s.n} | {s.lift:+.3f} | "
+                f"| {s.year} | {s.n} | {s.base_rate:.3f} | {s.p_fired:.3f} | "
+                f"{s.p_not_fired:.3f} | {s.lift:+.3f} | "
                 f"[{s.ci_low:+.3f}, {s.ci_high:+.3f}] | {s.rank_ic:+.3f} | "
                 f"{'Y' if s.significant_positive else '-'} |"
             )
