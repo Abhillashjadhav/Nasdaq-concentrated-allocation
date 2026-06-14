@@ -1,0 +1,202 @@
+name: Daily Job Search Pipeline
+
+# run-name surfaces test mode in the Actions UI so a no-Apify run can never
+# be mistaken for a real one at a glance.
+run-name: >-
+  Daily Job Search${{ github.event.inputs.test_mode_no_apify_zero_output_expected == 'true' && ' — ⚠️ TEST MODE (no-Apify, ZERO OUTPUT EXPECTED)' || '' }}
+
+on:
+  schedule:
+    # 03:00 UTC = 08:30 IST per CLAUDE.md mission line
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Run for specific date (YYYY-MM-DD). Defaults to today UTC.'
+        required: false
+        default: ''
+      test_mode_no_apify_zero_output_expected:
+        description: >-
+          DANGER: test mode. Skips Apify. A run with this ON is EXPECTED to
+          produce ZERO real output. Never use for a real daily run. Requires
+          confirm_test_mode=true or the run is refused at preflight.
+        type: boolean
+        default: false
+      confirm_test_mode:
+        description: >-
+          Must be set to true to acknowledge test mode. If test mode is on
+          and this is false, the run fails at preflight with a clear error.
+        type: boolean
+        default: false
+      apify_fallback_mode:
+        description: >-
+          strict = Apify required, fail if unavailable (default).
+          gmail_only = skip Apify, score on title+company at reduced
+          confidence + lower fit threshold.
+          skip = skip Apify entirely (gated by the test-mode confirmation).
+        type: choice
+        options: [strict, gmail_only, skip]
+        default: strict
+
+permissions:
+  contents: write
+
+jobs:
+  daily-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Liberation Sans fonts (for embedded-font resumes)
+        run: sudo apt-get install -y fonts-liberation
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Claude Code CLI (uses Max-plan OAuth, no API billing)
+        # Installs the `claude` CLI globally. At runtime it picks up
+        # CLAUDE_CODE_OAUTH_TOKEN from env and consumes against the user's
+        # Claude Max subscription quota — $0 incremental cost on the $200 plan.
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version || echo "claude CLI installed; version check non-fatal"
+
+      - name: Resolve run date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            echo "RUN_DATE=${{ github.event.inputs.date }}" >> $GITHUB_OUTPUT
+          else
+            echo "RUN_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Preflight — test-mode confirmation gate
+        # Test mode skips Apify and is EXPECTED to produce zero real output.
+        # It must be explicitly confirmed; an unconfirmed test-mode run is a
+        # configuration mistake and is failed loudly here, before any work.
+        env:
+          TEST_MODE: ${{ github.event.inputs.test_mode_no_apify_zero_output_expected }}
+          CONFIRM: ${{ github.event.inputs.confirm_test_mode }}
+        run: |
+          if [ "$TEST_MODE" = "true" ] && [ "$CONFIRM" != "true" ]; then
+            echo "::error::Test mode (test_mode_no_apify_zero_output_expected) is ON"
+            echo "::error::but confirm_test_mode is not true. Refusing to run."
+            echo "::error::Test mode skips Apify and produces ZERO real output."
+            echo "::error::If you genuinely want a test run, re-dispatch with"
+            echo "::error::confirm_test_mode=true. Otherwise turn test mode OFF."
+            exit 1
+          fi
+          if [ "$TEST_MODE" = "true" ]; then
+            echo "::warning::TEST MODE confirmed — Apify skipped, zero output expected."
+          else
+            echo "Preflight OK — normal run (Apify enabled)."
+          fi
+
+      - name: Diagnose secrets (length only, never value)
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+        run: |
+          echo "CLAUDE_CODE_OAUTH_TOKEN length: ${#CLAUDE_CODE_OAUTH_TOKEN}"
+          echo "APIFY_TOKEN length:             ${#APIFY_TOKEN}"
+          echo "GMAIL_REFRESH_TOKEN length:     ${#GMAIL_REFRESH_TOKEN}"
+          if [ "${#CLAUDE_CODE_OAUTH_TOKEN}" -eq 0 ]; then
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN secret is missing or empty — Opus path disabled"
+          else
+            echo "CLAUDE_CODE_OAUTH_TOKEN starts with: ${CLAUDE_CODE_OAUTH_TOKEN:0:13}..."
+          fi
+
+      - name: Run daily pipeline
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          # Preferred scoring path — uses Claude Max plan OAuth quota, $0 incremental.
+          # See docs/SETUP_GITHUB_ACTIONS.md Step 5.6 for one-time generation.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Legacy paid fallback — only used if CLAUDE_CODE_OAUTH_TOKEN is absent.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_TO: ${{ secrets.GMAIL_TO }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_PARENT_FOLDER_ID: ${{ secrets.GDRIVE_PARENT_FOLDER_ID }}
+          # Apify is skipped when test mode is on OR fallback mode is
+          # gmail_only / skip. TEST_MODE_NO_APIFY (the COMMIT 3 refusal gate)
+          # additionally fires for test mode and for fallback mode 'skip'.
+          # APIFY_FALLBACK_MODE drives the COMMIT 4 strict/gmail_only logic.
+          SKIP_APIFY: ${{ github.event.inputs.test_mode_no_apify_zero_output_expected == 'true' || github.event.inputs.apify_fallback_mode == 'gmail_only' || github.event.inputs.apify_fallback_mode == 'skip' }}
+          TEST_MODE_NO_APIFY: ${{ github.event.inputs.test_mode_no_apify_zero_output_expected == 'true' || github.event.inputs.apify_fallback_mode == 'skip' }}
+          APIFY_FALLBACK_MODE: ${{ github.event.inputs.apify_fallback_mode }}
+        run: |
+          python agent/run_daily.py --date ${{ steps.date.outputs.RUN_DATE }}
+
+      - name: Commit and push run artifacts to daily-runs branch
+        run: |
+          git config user.name 'dreamjob-agent[bot]'
+          git config user.email '[email protected]'
+          BRANCH="claude/daily-runs/${{ steps.date.outputs.RUN_DATE }}"
+          git checkout -B "$BRANCH"
+          git add outputs/${{ steps.date.outputs.RUN_DATE }}/ outputs/seen_index.jsonl
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "daily-run: ${{ steps.date.outputs.RUN_DATE }}"
+            for delay in 2 4 8 16; do
+              if git push -f -u origin "$BRANCH" 2>&1; then
+                echo "Push OK"; break
+              fi
+              echo "Retry in ${delay}s..."
+              sleep $delay
+            done
+          fi
+
+      # Persist seen_index.jsonl back to main so tomorrow's run starts with full
+      # cross-day history. The daily-runs/<date> branch is ephemeral — without
+      # this step, dedupe degrades to a single-day window and the same roles
+      # resurface every morning (confirmed bug 2026-05-26: 56% of fits were
+      # repeats from the prior 8 days).
+      - name: Persist seen_index.jsonl to main
+        run: |
+          git config user.name 'dreamjob-agent[bot]'
+          git config user.email '[email protected]'
+          BRANCH="claude/daily-runs/${{ steps.date.outputs.RUN_DATE }}"
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+          git checkout "$BRANCH" -- outputs/seen_index.jsonl
+          if git diff --cached --quiet; then
+            echo "seen_index unchanged on main"
+          else
+            git commit -m "seen_index: append ${{ steps.date.outputs.RUN_DATE }} [skip ci]"
+            for delay in 2 4 8 16; do
+              if git push origin main 2>&1; then
+                echo "seen_index pushed to main"; break
+              fi
+              echo "Retry in ${delay}s..."
+              sleep $delay
+            done
+          fi
+
+      - name: Upload artifacts (always, for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-run-${{ steps.date.outputs.RUN_DATE }}
+          path: |
+            outputs/${{ steps.date.outputs.RUN_DATE }}/
+            outputs/trajectory.jsonl
+          if-no-files-found: warn
+          retention-days: 30
