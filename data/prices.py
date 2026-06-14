@@ -13,6 +13,7 @@ frame silently — an empty result downstream would quietly collapse the univers
 from __future__ import annotations
 
 import logging
+import time
 from io import StringIO
 
 import pandas as pd
@@ -22,26 +23,77 @@ from store.schema import COLUMNS
 
 log = logging.getLogger(__name__)
 
+DEFAULT_RETRIES = 3
+DEFAULT_BASE_DELAY = 1.0  # seconds; doubled each retry (1, 2, 4, ...)
+DEFAULT_THROTTLE = 0.0  # polite pause between provider attempts
+
 
 class DataPullError(RuntimeError):
-    """Raised when no price data could be pulled from any provider."""
+    """Raised when no price data could be pulled from any provider.
+
+    Carries ``quarantine`` (provider -> reason) so the caller / coverage report
+    can record exactly why each source failed instead of silently dropping.
+    """
+
+    def __init__(self, message: str, quarantine: dict | None = None):
+        super().__init__(message)
+        self.quarantine = quarantine or {}
 
 
-def fetch_prices(ticker: str, start, end) -> pd.DataFrame:
+def fetch_prices(
+    ticker: str,
+    start,
+    end,
+    *,
+    retries: int = DEFAULT_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    throttle: float = DEFAULT_THROTTLE,
+    sleep=time.sleep,
+) -> pd.DataFrame:
     """Return daily closes for ``ticker`` in ``[start, end]`` as universal records.
 
-    Columns match ``store.schema`` (ticker, field="close", value, event_date,
-    knowledge_date, source). Raises ``DataPullError`` if both providers fail.
+    Each provider is attempted with retry + exponential backoff; a polite
+    ``throttle`` pause separates providers. If ALL providers exhaust their
+    retries, raises ``DataPullError`` whose ``quarantine`` names why each failed
+    — never an empty frame (CLAUDE.md: fail loud, no silent drops). ``sleep`` is
+    injectable so tests don't actually wait.
     """
-    frame, source = _from_yfinance(ticker, start, end)
-    if frame is None or frame.empty:
-        log.warning("yfinance returned no rows for %s; falling back to Stooq", ticker)
-        frame, source = _from_stooq(ticker, start, end)
-    if frame is None or frame.empty:
-        raise DataPullError(
-            f"No price data for {ticker!r} in [{start}, {end}] from yfinance or stooq"
+    quarantine: dict[str, str] = {}
+    for label, fn in (("yfinance", _from_yfinance), ("stooq", _from_stooq)):
+        frame = _pull_with_retry(
+            label, fn, ticker, start, end, retries=retries,
+            base_delay=base_delay, sleep=sleep,
         )
-    return _to_records(frame, ticker, source)
+        if frame is not None and not frame.empty:
+            return _to_records(frame, ticker, label)
+        quarantine[label] = f"retries exhausted ({retries}) — failed or empty"
+        if throttle:
+            sleep(throttle)
+    raise DataPullError(
+        f"No price data for {ticker!r} in [{start}, {end}]; "
+        f"quarantined providers: {quarantine}",
+        quarantine=quarantine,
+    )
+
+
+def _pull_with_retry(label, fn, ticker, start, end, *, retries, base_delay, sleep):
+    """Attempt ``fn`` up to ``retries`` times with exponential backoff; return a
+    non-empty frame or ``None`` once exhausted. Never raises — caller decides."""
+    for attempt in range(retries):
+        try:
+            frame, _ = fn(ticker, start, end)
+        except Exception as exc:  # transport/parse error -> retry
+            log.warning("%s attempt %d/%d for %s raised: %s",
+                        label, attempt + 1, retries, ticker, exc)
+            frame = None
+        if frame is not None and not frame.empty:
+            return frame
+        if attempt < retries - 1:
+            delay = base_delay * (2 ** attempt)
+            log.warning("%s attempt %d/%d for %s failed/empty; backoff %.2fs",
+                        label, attempt + 1, retries, ticker, delay)
+            sleep(delay)
+    return None
 
 
 def _from_yfinance(ticker, start, end):
