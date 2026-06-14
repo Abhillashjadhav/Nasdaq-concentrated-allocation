@@ -41,10 +41,14 @@ def test_get_data_is_the_chokepoint():
 
 
 def test_stubs_raise_not_implemented():
-    """Stubs must fail loud, not return a silent (and misleading) value."""
-    store = importlib.import_module("store")
+    """Not-yet-built stages must fail loud, not return a silent value.
+
+    (``store.get_data`` is implemented as of PR 2 and is covered by
+    tests/test_store.py; here we guard a stage still on the stub.)
+    """
+    universe = importlib.import_module("universe")
     with pytest.raises(NotImplementedError):
-        store.get_data("close", "AAPL", date(2016, 1, 1))
+        universe.get_universe(date(2016, 1, 1))
 
 
 def test_orchestrator_cli_parses():
