@@ -53,6 +53,8 @@ def test_stubs_raise_not_implemented():
 
 
 def test_orchestrator_cli_parses():
+    # main() is wired now (PR: run.py orchestrator); --help exercises the parser
+    # without needing a populated store.
     run = importlib.import_module("run")
-    with pytest.raises(NotImplementedError):
-        run.main(["--start-year", "2016", "--end-year", "2026"])
+    with pytest.raises(SystemExit):
+        run.main(["--help"])
