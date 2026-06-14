@@ -26,9 +26,23 @@ jobs:
 
       - name: Secret scan (fail on hardcoded tokens/keys)
         run: |
-          if grep -rniI -E "(api[_-]?key|secret|token)['\"]?\s*[:=]\s*['\"][A-Za-z0-9_]{16,}" \
-              --include='*.py' --include='*.json' --include='*.yaml' --include='*.yml' \
-              --exclude-dir=.git . ; then
+          patterns=(
+            # key: "value" assignments where key looks credential-ish
+            "(api[_-]?key|secret|token|password|passwd|credential)[\"']?[[:space:]]*[:=][[:space:]]*[\"'][A-Za-z0-9_+/-]{16,}"
+            # known vendor token value prefixes, scanned regardless of key name
+            "(apify_api_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})"
+          )
+          found=0
+          for p in "${patterns[@]}"; do
+            # exclude this scanner file itself; secrets belong in GitHub Secrets, never workflow YAML
+            if grep -rniI -E "$p" \
+                --include='*.py' --include='*.json' --include='*.yaml' --include='*.yml' \
+                --include='*.toml' --include='*.cfg' --include='*.ini' --include='*.env*' \
+                --exclude='ci.yml' --exclude-dir=.git . ; then
+              found=1
+            fi
+          done
+          if [ "$found" -ne 0 ]; then
             echo "::error::Possible hardcoded secret detected"
             exit 1
           fi
