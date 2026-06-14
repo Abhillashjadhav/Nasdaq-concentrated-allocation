@@ -43,13 +43,13 @@ def test_get_data_is_the_chokepoint():
 def test_stubs_raise_not_implemented():
     """Not-yet-built stages must fail loud, not return a silent value.
 
-    (the data, signal, macro, labeler, stats and walk-forward stages are
-    implemented in their PRs; here we guard the last stage still on the stub —
-    the report / GO-KILL verdict, PR 13.)
+    The §9 pipeline (data → report/verdict) is now complete; here we guard a
+    documented follow-up still on the stub — the Sharadar source adapter — so the
+    fail-loud-stub discipline stays exercised.
     """
-    report = importlib.import_module("report")
+    adapters = importlib.import_module("data.adapters")
     with pytest.raises(NotImplementedError):
-        report.build_report()
+        adapters.load_sharadar()
 
 
 def test_orchestrator_cli_parses():
