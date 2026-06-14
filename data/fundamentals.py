@@ -46,8 +46,9 @@ CONCEPTS = [
     ("long_term_debt", ["LongTermDebtNoncurrent", "LongTermDebt"], "USD"),
     ("current_assets", ["AssetsCurrent"], "USD"),
     ("current_liabilities", ["LiabilitiesCurrent"], "USD"),
-    ("shares_outstanding", ["CommonStockSharesOutstanding",
-                            "EntityCommonStockSharesOutstanding"], "shares"),
+    # (dei cover-page EntityCommonStockSharesOutstanding lives outside us-gaap and
+    # is a documented follow-up; a company exposing only that is flagged as a gap.)
+    ("shares_outstanding", ["CommonStockSharesOutstanding"], "shares"),
     ("gross_profit", ["GrossProfit"], "USD"),
     ("revenue", ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
                  "SalesRevenueNet"], "USD"),
@@ -61,6 +62,7 @@ class FundamentalsResult:
     records: pd.DataFrame
     gaps: list[dict] = dc_field(default_factory=list)
     n_written: int = 0
+    n_skipped_unusable: int = 0  # facts dropped for a missing val/end/filed (no PIT key)
 
 
 def _entries_for(usgaap: dict, tags: list[str], unit: str):
@@ -91,6 +93,7 @@ def fetch_fundamentals(
 
     rows: list[dict] = []
     gaps: list[dict] = []
+    n_skipped = 0
     for field, tags, unit in CONCEPTS:
         entries = _entries_for(usgaap, tags, unit)
         if entries is None:
@@ -99,6 +102,7 @@ def fetch_fundamentals(
             continue
         for e in entries:
             if e.get("val") is None or e.get("end") is None or e.get("filed") is None:
+                n_skipped += 1  # unusable fact (no PIT key) — counted, not silent
                 continue
             rows.append({
                 "ticker": ticker.upper(), "field": field, "value": float(e["val"]),
@@ -118,4 +122,4 @@ def fetch_fundamentals(
     if write and not records.empty:
         n_written = (store or store_pkg).put_data(records)
 
-    return FundamentalsResult(ticker.upper(), cik, records, gaps, n_written)
+    return FundamentalsResult(ticker.upper(), cik, records, gaps, n_written, n_skipped)
