@@ -1,11 +1,25 @@
+# Secrets — never commit credentials
+.env
+*.env
+.env.*
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.DS_Store
-.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
 venv/
 .venv/
-*.egg-info/
-outputs/trajectory.jsonl
-data/validation_runs/
-data/validation_jds/
+
+# OS / editor
+.DS_Store
+
+# Local data caches (point-in-time store artifacts are large and regenerable)
+data/cache/
+store/cache/
+*.parquet
