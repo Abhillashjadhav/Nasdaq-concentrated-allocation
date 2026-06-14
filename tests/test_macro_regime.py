@@ -81,6 +81,21 @@ def test_single_condition_keeps_gate_open(tmp_path):
     assert sum(bool(v) for v in res.conditions.values()) == 1  # exactly one fired
 
 
+def test_vix_level_break_without_lookback(tmp_path):
+    """VIX has only a single (recent) point -> no lookback, but the absolute-level
+    trigger (>=30) still fires; with OAS/rate also firing the gate closes."""
+    rows = [
+        _pt(HY_OAS, OLD, OLD_REL, 4.0), _pt(HY_OAS, RECENT, RECENT_REL, 8.0),
+        _pt(POLICY_RATE, OLD, OLD_REL, 2.5), _pt(POLICY_RATE, RECENT, RECENT_REL, 3.5),
+        _pt(VIX, RECENT, RECENT_REL, 60.0),  # single point -> no lookback
+    ]
+    res = regime_state(AS_OF, store=_store(tmp_path, rows))
+    assert res.insufficient_data is False
+    assert res.conditions["vix_breaking"] is True
+    assert res.components["vix_change"] is None  # confirms the no-lookback path
+    assert res.state == "risk_off" and res.gate_closed is True
+
+
 def test_missing_series_fails_safe_to_risk_off(tmp_path):
     """A missing macro series must NOT default to risk-on (stay invested) — it
     fails safe to risk-off with the gate closed and the gap named."""
