@@ -1,14 +1,20 @@
-"""Reporting: per-signal lift table + GO/KILL verdict (ARCHITECTURE.md §10).
+"""Reporting: per-signal lift table + GO/KILL verdict (ARCHITECTURE.md §3, §10).
 
-Emits the per-signal conditional-lift table (CI, p-value), the >=3-year
-consistency check, and the final GO / KILL / Partial verdict.
+Emits the per-signal conditional-lift table (CI, rank-IC), the per-year detail,
+the coverage report, and the final GO / MARGINAL / KILL verdict computed exactly
+against the §10 thresholds.
 
-Implemented in PR 13 (ARCHITECTURE.md §9).
+Implementation lives in ``report.build_report``.
 """
 
 from __future__ import annotations
 
+from .build_report import (
+    Report,
+    SignalVerdict,
+    build_report,
+    evaluate_signal,
+    resolve_verdict,
+)
 
-def build_report(*args, **kwargs):
-    """Render the per-signal lift table and resolve GO / KILL / Partial."""
-    raise NotImplementedError("Report + GO/KILL verdict land in PR 13")
+__all__ = ["build_report", "Report", "SignalVerdict", "evaluate_signal", "resolve_verdict"]

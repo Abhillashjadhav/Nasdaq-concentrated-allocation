@@ -46,6 +46,8 @@ CONSISTENCY_YEARS = 3  # an edge must hold in >=3 distinct years (§3, §10)
 class SliceResult:
     year: int
     n: int
+    n_fired: int
+    n_not_fired: int
     base_rate: float
     p_fired: float
     p_not_fired: float
@@ -156,8 +158,9 @@ def run_walk_forward(
             result.skipped_years.append(int(year))  # e.g. an empty arm in this slice
             continue
         result.slices.append(SliceResult(
-            year=int(year), n=r.n, base_rate=r.base_rate, p_fired=r.p_fired,
-            p_not_fired=r.p_not_fired, lift=r.lift, ci_low=r.ci_low, ci_high=r.ci_high,
+            year=int(year), n=r.n, n_fired=r.n_fired, n_not_fired=r.n_not_fired,
+            base_rate=r.base_rate, p_fired=r.p_fired, p_not_fired=r.p_not_fired,
+            lift=r.lift, ci_low=r.ci_low, ci_high=r.ci_high,
             p_value=r.p_value, rank_ic=r.rank_ic,
         ))
 
