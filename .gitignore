@@ -20,6 +20,8 @@ venv/
 .DS_Store
 
 # Local data caches (point-in-time store artifacts are large and regenerable)
+.data_cache/
 data/cache/
 store/cache/
 *.parquet
+*.sqlite

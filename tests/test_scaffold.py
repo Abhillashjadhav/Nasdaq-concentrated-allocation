@@ -41,10 +41,14 @@ def test_get_data_is_the_chokepoint():
 
 
 def test_stubs_raise_not_implemented():
-    """Stubs must fail loud, not return a silent (and misleading) value."""
-    store = importlib.import_module("store")
+    """Not-yet-built stages must fail loud, not return a silent value.
+
+    (store.get_data lands in PR 2 and universe.get_universe in PR 4; here we
+    guard a stage still on the stub — the macro regime gate, PR 9.)
+    """
+    macro = importlib.import_module("macro")
     with pytest.raises(NotImplementedError):
-        store.get_data("close", "AAPL", date(2016, 1, 1))
+        macro.regime(date(2016, 1, 1))
 
 
 def test_orchestrator_cli_parses():
