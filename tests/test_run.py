@@ -105,6 +105,32 @@ def test_partial_readiness_marks_others_not_run(tmp_path):
     assert Path(res.report_path).exists()
 
 
+def test_mixed_readiness_distinguishes_all_statuses(tmp_path):
+    """evaluated vs insufficient_data (adapter present, data missing) vs not_run
+    (no adapter) vs unknown_signal must all coexist without crashing."""
+    store, winners, losers = _build_store(tmp_path)
+    cfg = RunConfig(
+        store=store, tickers=winners + losers,
+        entry_dates=[date(y, 1, 1) for y in YEARS],
+        active_signals=["alpha", "broken", "norun", "ghost"],  # ghost: not in registry
+        output_dir=str(tmp_path / "mixed"),
+        signals={
+            "alpha": SignalSpec("alpha", _planted_scorer(winners), True),
+            "broken": SignalSpec("broken", lambda *_: (None, True), True),  # always insufficient
+            "norun": SignalSpec("norun", _never, False),
+        },
+        min_samples_per_arm=10, two_arm_kwargs={"threshold": 60.0, "n_boot": 200},
+    )
+    res = run(cfg)
+
+    assert res.statuses["alpha"] == "evaluated"
+    assert res.statuses["broken"].startswith("insufficient_data")  # adapter ok, data missing
+    assert res.statuses["norun"] == "not_run"                      # no adapter at all
+    assert res.statuses["ghost"] == "unknown_signal"
+    assert res.not_run == ["norun"]
+    assert Path(res.report_path).exists()  # still produced a report from the one good signal
+
+
 def test_fail_loud_when_required_input_missing(tmp_path):
     # no benchmark series -> every label is not-yet-known -> nothing evaluable
     store, winners, losers = _build_store(tmp_path, with_benchmark=False)
