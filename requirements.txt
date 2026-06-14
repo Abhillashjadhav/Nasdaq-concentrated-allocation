@@ -1,7 +1,7 @@
-pyyaml
-pypdf
-reportlab
-cryptography
-markdown
+# stockscope — backtest harness dependencies
+pandas
+numpy
+scipy
+pandera
 pytest
 requests
