@@ -75,6 +75,15 @@ def _band(x: float, lo: float, hi: float) -> float:
     return max(0.0, min(1.0, (x - lo) / (hi - lo))) * 100.0
 
 
+def _snapshots_latest_first(store, field, ticker, as_of):
+    """A snapshot is identified by its ``knowledge_date``; order newest-first by
+    that, not by ``event_date`` — so the two-snapshot diff is correct even if a
+    future ingest set ``event_date`` to the fiscal period rather than the snapshot
+    date. One snapshot per knowledge_date is assumed for this field."""
+    rows = store.get_data(field, ticker, as_of)
+    return rows.sort_values("knowledge_date", ascending=False).reset_index(drop=True)
+
+
 def revision_breadth_score(
     ticker: str,
     as_of: date,
@@ -86,9 +95,9 @@ def revision_breadth_score(
     differencing the two most recent snapshots. Reads only via store.get_data."""
     store = store or store_pkg
 
-    up = store.get_data(FIELDS["up_cum"], ticker, as_of)  # newest snapshot first
-    down = store.get_data(FIELDS["down_cum"], ticker, as_of)
-    n_an = store.get_data(FIELDS["n_analysts"], ticker, as_of)
+    up = _snapshots_latest_first(store, FIELDS["up_cum"], ticker, as_of)
+    down = _snapshots_latest_first(store, FIELDS["down_cum"], ticker, as_of)
+    n_an = _snapshots_latest_first(store, FIELDS["n_analysts"], ticker, as_of)
     n_snap = min(len(up), len(down), len(n_an))
     if n_snap < MIN_SNAPSHOTS:
         return RevisionBreadthScore(
@@ -110,7 +119,7 @@ def revision_breadth_score(
     breadth = (up_window - down_window) / analysts
     score = _band(breadth, *BREADTH_BAND)
 
-    cons = store.get_data(FIELDS["consensus"], ticker, as_of)
+    cons = _snapshots_latest_first(store, FIELDS["consensus"], ticker, as_of)
     consensus_delta = (
         float(cons.iloc[0]["value"]) - float(cons.iloc[1]["value"])
         if len(cons) >= 2 else None
