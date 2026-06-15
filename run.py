@@ -33,14 +33,22 @@ import pandas as pd
 from backtest.labels import BENCHMARK_TICKER, label_winner
 from backtest.walk_forward import run_walk_forward
 from report.build_report import build_report
+from report.ranking import rank_as_of, render_ranking_markdown
 from signals.insider import insider_cluster_score
 from signals.momentum import momentum_score
 from signals.quality import quality_score
 from signals.revisions import revision_breadth_score
 from stats.two_arm import OBSERVATION_SCHEMA
+from universe.hc_tech import classify_and_cache, nasdaq_hc_tech_universe
+from universe.nasdaq_directory import fetch_listed_symbols
 from universe.universe import build_universe
 
 OBS_COLS = ["ticker", "as_of", "score", "is_winner", "excess_return"]
+_FAR_FUTURE = date(2100, 1, 1)
+_SIGNAL_FNS = {
+    "momentum": momentum_score, "quality": quality_score,
+    "revisions": revision_breadth_score, "insiders": insider_cluster_score,
+}
 
 
 class PipelineError(RuntimeError):
@@ -271,17 +279,63 @@ def run(config: RunConfig) -> RunResult:
     )
 
 
+def _make_scorer(fn):
+    def scorer(ticker, as_of, store):  # -> composite sub-score | None
+        r = fn(ticker, as_of, store=store)
+        return None if r.insufficient_data else r.score
+    return scorer
+
+
+def _signal_scorers(active_signals) -> dict:
+    return {n: _make_scorer(_SIGNAL_FNS[n]) for n in active_signals if n in _SIGNAL_FNS}
+
+
+@dataclass
+class RankingRun:
+    results: list
+    coverage: dict
+    report_path: str
+
+
+def run_ranking(config, *, asof_dates, top_n, symbols, n_quarantined=0, scorers=None):
+    """Rank the tech+healthcare universe as-of each date and write ranking.md.
+    ``scorers`` defaults to the active signals' point-in-time scorers."""
+    store = config.store
+    scorers = scorers if scorers is not None else _signal_scorers(config.active_signals)
+    if not scorers:
+        raise PipelineError("ranking needs at least one scorable signal in --signals")
+
+    results = [
+        rank_as_of(ao, nasdaq_hc_tech_universe(ao, symbols, store=store),
+                   store=store, scorers=scorers, top_n=top_n, benchmark=config.benchmark)
+        for ao in asof_dates
+    ]
+    classified = nasdaq_hc_tech_universe(_FAR_FUTURE, symbols, store=store)
+    n_priced = sum(1 for s in classified if not store.get_data("close", s, _FAR_FUTURE).empty)
+    coverage = {"n_universe": len(symbols), "n_classified": len(classified),
+                "n_priced": n_priced, "n_quarantined": n_quarantined}
+
+    md = render_ranking_markdown(results, coverage=coverage,
+                                 signal_names=[n for n in config.active_signals if n in scorers])
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "ranking.md"
+    path.write_text(md)
+    return RankingRun(results=results, coverage=coverage, report_path=str(path))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stockscope",
         description="Winner-signal backtest harness (GO/KILL). See ARCHITECTURE.md.",
     )
     parser.add_argument("--db", required=True, help="path to the point-in-time store SQLite file")
-    parser.add_argument("--tickers", required=True, help="comma-separated candidate tickers")
+    parser.add_argument("--tickers", default=None,
+                        help="comma-separated candidate tickers (backtest mode)")
     parser.add_argument("--start-year", type=int, default=2016)
     parser.add_argument("--end-year", type=int, default=2026)
     parser.add_argument("--signals", default="momentum,quality", help="comma-separated active signals")
-    parser.add_argument("--output", default="outputs", help="directory for report.md")
+    parser.add_argument("--output", default="outputs", help="directory for the report")
     parser.add_argument("--liquidity-filter", action="store_true")
     parser.add_argument("--ingest", action="store_true", help="call live adapters to populate the store")
     parser.add_argument(
@@ -289,13 +343,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="override the walk-forward per-slice observation floor (default ~20, "
              "strict — lower it only for small validation slices)",
     )
+    # rank-as-of-date funnel
+    parser.add_argument("--universe", choices=["nasdaq-hc-tech"], default=None,
+                        help="build the real Nasdaq healthcare+tech universe (ranking mode)")
+    parser.add_argument("--rank-asof", action="append", type=date.fromisoformat, default=None,
+                        metavar="YYYY-MM-DD", help="rank the universe as-of this date (repeatable)")
+    parser.add_argument("--top-n", type=int, default=25, help="rows to show per ranking table")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     from store.store import PITStore
+
+    signals = [s.strip() for s in args.signals.split(",") if s.strip()]
+
+    # --- ranking mode: rank the real universe as-of date(s) ------------------
+    if args.rank_asof:
+        if args.universe != "nasdaq-hc-tech":
+            parser.error("--rank-asof requires --universe nasdaq-hc-tech")
+        store = PITStore(args.db)
+        config = RunConfig(store=store, tickers=[], entry_dates=list(args.rank_asof),
+                           active_signals=signals, output_dir=args.output, ingest=args.ingest)
+        symbols = fetch_listed_symbols()
+        n_quarantined = 0
+        if args.ingest:
+            from data.edgar_client import CikResolver, EdgarClient
+            edgar = EdgarClient()
+            cres = classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar), store=store)
+            config.tickers = nasdaq_hc_tech_universe(max(args.rank_asof), symbols, store=store)
+            n_quarantined = cres.n_quarantined + len(_ingest(config, store))
+        rr = run_ranking(config, asof_dates=list(args.rank_asof), top_n=args.top_n,
+                         symbols=symbols, n_quarantined=n_quarantined)
+        print(f"RANKING -> {rr.report_path}  (coverage: {rr.coverage})")
+        return 0
+
+    # --- backtest mode (GO/KILL) ---------------------------------------------
+    if not args.tickers:
+        parser.error("--tickers is required unless --rank-asof is given")
 
     # Only override the strict default floor when the flag is given.
     two_arm_kwargs = ({} if args.min_obs_per_slice is None
@@ -304,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
         store=PITStore(args.db),
         tickers=[t.strip() for t in args.tickers.split(",") if t.strip()],
         entry_dates=[date(y, 1, 1) for y in range(args.start_year, args.end_year + 1)],
-        active_signals=[s.strip() for s in args.signals.split(",") if s.strip()],
+        active_signals=signals,
         output_dir=args.output,
         apply_liquidity_filter=args.liquidity_filter,
         ingest=args.ingest,
