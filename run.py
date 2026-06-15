@@ -122,7 +122,9 @@ def _ingest(config, store) -> list[dict]:
     not a per-ticker data gap. Returns the quarantine records (evals.coverage shape)."""
     # Local imports keep network deps out of import time AND make the adapters
     # monkeypatchable per-call in tests (rebound from their modules each call).
-    from data.edgar_client import EdgarHTTPError, UnknownTickerError  # per-ticker EDGAR errors
+    from data.edgar_client import (  # per-ticker EDGAR errors + shared client/resolver
+        CikResolver, EdgarClient, EdgarHTTPError, UnknownTickerError,
+    )
     from data.form4 import fetch_insider_buys
     from data.fundamentals import fetch_fundamentals  # local import: network deps
     from data.prices import DataPullError, fetch_prices
@@ -155,16 +157,22 @@ def _ingest(config, store) -> list[dict]:
         quarantine.append({"ticker": config.benchmark, "field": "close",
                            "reason": f"benchmark_price_unavailable: {exc}", "vendor": "prices"})
 
+    # One EDGAR client + resolver for ALL tickers, so a single throttle governs the
+    # AGGREGATE request rate across the whole run (SEC rate-limits by IP, not per
+    # ticker). The resolver's company_tickers map is also fetched just once.
+    edgar = EdgarClient()
+    resolver = CikResolver(edgar)
     for ticker in config.tickers:
         try:
-            fetch_fundamentals(ticker, store=store, write=True)
+            fetch_fundamentals(ticker, client=edgar, resolver=resolver, store=store, write=True)
         except edgar_errs as exc:  # delisted / transient -> quarantine, don't abort
             quarantine.append({"ticker": ticker, "field": "fundamentals",
                                "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
 
     for ticker in config.tickers:
         try:
-            res = fetch_insider_buys(ticker, store=store, write=True, start=start, end=end)
+            res = fetch_insider_buys(ticker, client=edgar, resolver=resolver,
+                                     store=store, write=True, start=start, end=end)
             quarantine.extend(getattr(res, "gaps", []))  # per-filing quarantines surfaced
         except edgar_errs as exc:
             quarantine.append({"ticker": ticker, "field": "form4_buy_P",
