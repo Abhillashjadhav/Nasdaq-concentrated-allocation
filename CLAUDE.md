@@ -60,3 +60,13 @@ The `pr-reviewer` agent (`.claude/agents/pr-reviewer.md`) enforces them on every
 * Don't present a winners-only result.
 * Don't add logic without its guarding eval.
 * Don't pull live-trading / Kelly / LLM-debate concerns into this repo (§11).
+
+## Explain-before-build (standing rule)
+
+Before writing any code, build prompt, or running any command, always lead with a plain-English explanation:
+1. Which ARCHITECTURE.md section / PR this maps to.
+2. What it builds, in plain language (core terminology kept, but explained simply).
+3. Why it matters / what it unblocks.
+4. The success test — how we'll know it worked.
+
+Only after that explanation, build — one step at a time. Keep technical jargon layered in *after* the plain-language foundation, never as a substitute for it. Verbose, jargon-dense, or bullet-slop output is a failure mode; be concise and direct.
