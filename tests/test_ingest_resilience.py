@@ -46,6 +46,9 @@ def _fake_edgar(ticker, *args, **kwargs):  # fundamentals / form4 stand-in
 
 
 def _patch_all(monkeypatch):
+    # _ingest now constructs one shared EdgarClient (needs a User-Agent); the
+    # monkeypatched fetch_* ignore the client they receive.
+    monkeypatch.setenv("STOCKSCOPE_SEC_USER_AGENT", "test test@example.com")
     monkeypatch.setattr(prices_mod, "fetch_prices", _fake_prices)
     monkeypatch.setattr(fundamentals_mod, "fetch_fundamentals", _fake_edgar)
     monkeypatch.setattr(form4_mod, "fetch_insider_buys", _fake_edgar)
@@ -84,3 +87,36 @@ def test_zero_priced_tickers_is_fatal(tmp_path, monkeypatch):
     _patch_all(monkeypatch)
     with pytest.raises(PipelineError):
         _ingest(_config(store, [BAD]), store)  # the only ticker's price fetch fails
+
+
+def test_ingest_shares_one_edgar_client_across_tickers(tmp_path, monkeypatch):
+    """All per-ticker EDGAR calls receive the SAME client+resolver, so one throttle
+    governs the whole multi-ticker run (SEC rate-limits by IP, not per ticker)."""
+    from data.edgar_client import CikResolver, EdgarClient
+
+    monkeypatch.setenv("STOCKSCOPE_SEC_USER_AGENT", "test test@example.com")
+    monkeypatch.setattr(prices_mod, "fetch_prices", _fake_prices)  # all good
+
+    clients, resolvers = [], []
+
+    class _Res:
+        gaps: list = []
+
+    def _cap_fund(ticker, *, client=None, resolver=None, **k):
+        clients.append(client); resolvers.append(resolver); return None
+
+    def _cap_form4(ticker, *, client=None, resolver=None, **k):
+        clients.append(client); resolvers.append(resolver); return _Res()
+
+    monkeypatch.setattr(fundamentals_mod, "fetch_fundamentals", _cap_fund)
+    monkeypatch.setattr(form4_mod, "fetch_insider_buys", _cap_form4)
+
+    store = PITStore(tmp_path / "shared.sqlite")
+    _ingest(_config(store, ["AAA", "BBB", "CCC"]), store)
+
+    # 3 tickers x 2 EDGAR sources (fundamentals + form4) = 6 calls
+    assert len(clients) == 6
+    assert all(isinstance(c, EdgarClient) for c in clients)
+    assert len({id(c) for c in clients}) == 1            # one shared client across tickers
+    assert all(isinstance(r, CikResolver) for r in resolvers)
+    assert len({id(r) for r in resolvers}) == 1          # one shared resolver too
