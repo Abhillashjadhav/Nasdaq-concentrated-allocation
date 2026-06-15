@@ -349,6 +349,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank-asof", action="append", type=date.fromisoformat, default=None,
                         metavar="YYYY-MM-DD", help="rank the universe as-of this date (repeatable)")
     parser.add_argument("--top-n", type=int, default=25, help="rows to show per ranking table")
+    parser.add_argument("--refresh-universe", action="store_true",
+                        help="force re-classification of the universe (ignore cached SIC)")
+    parser.add_argument("--universe-limit", type=int, default=None,
+                        help="cap the universe size for a fast smoke test before a full run")
     return parser
 
 
@@ -368,11 +372,14 @@ def main(argv: list[str] | None = None) -> int:
         config = RunConfig(store=store, tickers=[], entry_dates=list(args.rank_asof),
                            active_signals=signals, output_dir=args.output, ingest=args.ingest)
         symbols = fetch_listed_symbols()
+        if args.universe_limit is not None:
+            symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
         n_quarantined = 0
         if args.ingest:
             from data.edgar_client import CikResolver, EdgarClient
             edgar = EdgarClient()
-            cres = classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar), store=store)
+            cres = classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar),
+                                      store=store, refresh=args.refresh_universe)
             config.tickers = nasdaq_hc_tech_universe(max(args.rank_asof), symbols, store=store)
             n_quarantined = cres.n_quarantined + len(_ingest(config, store))
         rr = run_ranking(config, asof_dates=list(args.rank_asof), top_n=args.top_n,
