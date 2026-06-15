@@ -99,6 +99,7 @@ class RunResult:
     observations: dict[str, pd.DataFrame]
     report_path: str
     not_run: list[str]
+    ingest_quarantine: list[dict] = field(default_factory=list)  # tickers skipped at ingest
 
 
 def _resolve_universe(as_of, config, store) -> list[str]:
@@ -110,26 +111,69 @@ def _resolve_universe(as_of, config, store) -> list[str]:
     return list(config.tickers)
 
 
-def _ingest(config, store) -> None:
-    """Best-effort live ingest via the available adapters (network). Only runs
-    when config.ingest is True; failures are surfaced, never silently swallowed."""
+def _ingest(config, store) -> list[dict]:
+    """Best-effort live ingest via the available adapters (network). Only runs when
+    config.ingest is True. A per-ticker price failure (e.g. a delisted name with no
+    free data) is caught, recorded as a quarantined coverage gap, and skipped so the
+    rest of the universe proceeds; the run fails only if NO universe ticker ingests.
+    The same per-ticker resilience applies to fundamentals and Form 4 (a delisted /
+    transient failure quarantines that ticker's data for that source, never aborts).
+    Config errors (e.g. a missing SEC User-Agent) still propagate — that is setup,
+    not a per-ticker data gap. Returns the quarantine records (evals.coverage shape)."""
+    from data.edgar_client import EdgarHTTPError, UnknownTickerError  # per-ticker EDGAR errors
+    from data.form4 import fetch_insider_buys
     from data.fundamentals import fetch_fundamentals  # local import: network deps
-    from data.prices import fetch_prices
+    from data.prices import DataPullError, fetch_prices
+
+    edgar_errs = (UnknownTickerError, EdgarHTTPError)
 
     start = min(config.entry_dates).replace(year=min(d.year for d in config.entry_dates) - 2)
     end = max(config.entry_dates).replace(year=max(d.year for d in config.entry_dates) + 1)
-    for ticker in list(config.tickers) + [config.benchmark]:
-        store.put_data(fetch_prices(ticker, start, end))  # raises loud on total failure
+
+    quarantine: list[dict] = []
+    n_priced = 0
     for ticker in config.tickers:
-        fetch_fundamentals(ticker, store=store, write=True)
+        try:
+            store.put_data(fetch_prices(ticker, start, end))
+            n_priced += 1
+        except DataPullError as exc:  # delisted / no free data -> quarantine, don't abort
+            quarantine.append({"ticker": ticker, "field": "close",
+                               "reason": f"price_unavailable: {exc}", "vendor": "prices"})
+    if n_priced == 0:
+        raise PipelineError(
+            "ingest produced no priced tickers (every fetch_prices failed); "
+            "refusing to proceed"
+        )
+
+    # The benchmark is needed to grade; quarantine (not abort) if it fails — the
+    # labeler then surfaces the gap downstream.
+    try:
+        store.put_data(fetch_prices(config.benchmark, start, end))
+    except DataPullError as exc:
+        quarantine.append({"ticker": config.benchmark, "field": "close",
+                           "reason": f"benchmark_price_unavailable: {exc}", "vendor": "prices"})
+
+    for ticker in config.tickers:
+        try:
+            fetch_fundamentals(ticker, store=store, write=True)
+        except edgar_errs as exc:  # delisted / transient -> quarantine, don't abort
+            quarantine.append({"ticker": ticker, "field": "fundamentals",
+                               "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
+
+    for ticker in config.tickers:
+        try:
+            fetch_insider_buys(ticker, store=store, write=True)
+        except edgar_errs as exc:
+            quarantine.append({"ticker": ticker, "field": "form4_buy_P",
+                               "reason": f"form4_unavailable: {exc}", "vendor": "edgar"})
+    return quarantine
 
 
 def run(config: RunConfig) -> RunResult:
     """Run the end-to-end pipeline and write the GO/KILL report. See module docstring."""
     store = config.store
     signals = config.signals or DEFAULT_SIGNALS
-    if config.ingest:
-        _ingest(config, store)
+    ingest_quarantine = _ingest(config, store) if config.ingest else []
 
     statuses: dict[str, str] = {}
     runnable: list[tuple[str, SignalSpec]] = []
@@ -206,6 +250,7 @@ def run(config: RunConfig) -> RunResult:
     return RunResult(
         report=report, statuses=statuses, observations=observations,
         report_path=str(path), not_run=[n for n, s in statuses.items() if s == "not_run"],
+        ingest_quarantine=ingest_quarantine,
     )
 
 
