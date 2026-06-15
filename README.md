@@ -1,65 +1,82 @@
-# stockscope — Winner-Signal Backtest Harness
+# stockscope — a winner-signal backtest harness that refuses to fool you
 
-A point-in-time, survivorship-free, two-arm backtest harness that decides
-**GO / KILL** on a small set of proven equity signals before any live
-capital or live system is built.
+This repo answers one question before any capital or any live trading system gets built:
 
-> Do a small set of proven signals separate future winners from losers in US
-> Nasdaq healthcare + technology stocks — with a statistically significant edge
-> over the base rate, holding across ≥3 distinct years?
+> Do a small set of proven signals — measured strictly point-in-time, on a survivorship-free universe — separate future *winners* from *losers* in US Nasdaq healthcare and technology stocks, with an edge over the base rate that survives costs and holds across multiple years?
 
-`ARCHITECTURE.md` is the source of truth for the design, the non-negotiables,
-and the PR sequence. Read it first.
+The answer the harness gives is a verdict: **GO** (the signals earned the right to drive a live system), **MARGINAL**, or **KILL** (they didn't — stop here, having spent a small harness instead of a full build and real money).
 
-## The three non-negotiables
+On its first end-to-end run against real SEC EDGAR, FRED, and price data, it returned **KILL**. That result is the point of this README — not because the signals are worthless, but because **the verdict is honest about what the data can and cannot support**, and producing that honesty is the entire engineering problem.
 
-1. **No peeking** — all data access goes through `store.get_data()`, which
-   filters `knowledge_date <= as_of`. Enforced by a leak test.
-2. **Survivorship-free** — the historical universe includes delisted/merged/
-   bankrupt names. Enforced by a test.
-3. **Two-arm** — every signal reports P(winner | signal) vs base rate, with the
-   losers explicitly counted. Winners-only views are forbidden.
+---
 
-## Status
+## Why a KILL is the result worth showing
 
-PR 1 — **scaffold**. Directory tree, docs, the ported `pr-reviewer` agent, CI,
-and empty stubs are in place. Every module raises `NotImplementedError` until
-its dedicated PR (see `ARCHITECTURE.md` §9) fills it in, evals-first.
+It is trivial to write a backtest that prints an exciting number. It is hard to write one that tells you when your evidence is too thin to trust — and then refuses to bless it. This harness is built to do the second thing.
 
-## Repo layout
+The first real run scored two signals (momentum and quality) across 2018–2022 on a 28-ticker universe. Both came back blocked:
 
-```
-data/      source adapters (Sharadar default; EDGAR fallback)
-store/     point-in-time store + get_data() chokepoint
-universe/  survivorship-free universe + liquidity filter
-signals/   momentum, revisions, insiders, quality, boosters
-macro/     HY OAS, VIX, Fed-direction -> regime gate
-backtest/  walk-forward + purge/embargo runner
-stats/     two-arm lift, CIs, p-values, rank-IC
-evals/     tool-level + IO-level eval suites
-report/    per-signal lift table + GO/KILL verdict
-tests/     golden-case fixtures
-run.py     plain-Python orchestrator
-```
+| signal | mean lift | net of 4pp haircut | rank-IC | held in | sample floor |
+|---|---|---|---|---|---|
+| momentum | −0.005 | −0.045 | +0.071 | 0 of 5 years | LOW (min arm 30 < 300) |
+| quality | −0.128 | −0.168 | −0.072 | 0 of 5 years | LOW (min arm 16 < 300) |
 
-## Quickstart
+Read the per-year detail and the reason becomes obvious. Momentum's best year (2021, +0.179 lift) carries a confidence interval of **[−0.214, +0.607]** — it spans zero by a wide margin. With ~28 names over 5 years, *nothing in this sample could ever reach significance.* The harness says so directly: `sample floor not met`.
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pytest                 # eval + golden-case suites
-python run.py --help   # orchestrator entry point
-```
+So the KILL is not a statement that momentum and quality don't work in the real world. It is a statement that **this sample — small, survivor-only, five independent year-slices — physically cannot support a GO**, and the harness was engineered to detect exactly that and stop. A naive backtest would have pooled the 280 overlapping monthly observations into a tight, false-looking confidence interval and printed GO. This one de-overlaps to 5 real slices, applies a survivorship/cost haircut, enforces a sample-size floor, and declines.
 
-## Eval-first discipline
+That discipline is the artifact.
 
-Per `ARCHITECTURE.md` §8, the eval that guards a piece of logic lands **before
-or with** that logic — never after. Tool-level evals (no-peek, survivorship,
-filing-lag, signal golden cases, stats calibration) and IO-level evals (Pandera
-schemas, range asserts, reconciliation, sample-size floor) are first-class.
+---
 
-## Out of scope
+## The three non-negotiables (enforced by tests, not by trust)
 
-Live trading, order execution, Kelly sizing, the Bull/Critic/Reconciler LLM
-debate, and the 15-day live cadence are explicitly **not** in this repo
-(`ARCHITECTURE.md` §11). They come after a GO verdict, in a separate build.
+Most backtests die from one of three quiet errors. Each is closed here by an automated check that is *designed to fail* if the protection is removed:
+
+1. **No peeking (look-ahead leakage).** Every datum carries a `knowledge_date` — the day it actually became public. All data access flows through a single function, `get_data(field, ticker, as_of)`, that returns only rows where `knowledge_date <= as_of`. No signal reads raw data directly. A leak test proves the chokepoint is non-vacuous: it plants a future-dated row in a deliberately leaky store and confirms the test catches it. Filing lags are modeled explicitly (a Q4 result with period-end 2020-12-31 but filed 2021-02-26 is correctly invisible on a 2021-01-31 decision date).
+
+2. **Survivorship-free universe.** Using today's survivors inflates returns by 1–4%/yr and can reverse conclusions. The universe at any historical date is meant to include companies since delisted, merged, or bankrupt; a known-delisted ticker must appear in its historical universe or the test fails. *(See the honest limitation below — this is the part the current run does not yet fully satisfy.)*
+
+3. **Two-arm comparison.** Every signal is judged on `P(winner | signal fired)` versus the unconditional base rate, with the losers — the same-signal non-winners — explicitly counted. A winners-only view is structurally forbidden. The stats engine is calibration-tested: fed synthetic data with a known injected lift of 0.20, it recovers 0.203; fed a true-null dataset, it correctly reports zero lift.
+
+---
+
+## How it works
+
+A plain-Python `run.py` orchestrates four components. There is **no LLM in the run path** — an LLM orchestrator would add cost and non-determinism to what is fundamentally a numeric experiment. (The harness is free to run; the only judgment calls happen at design time, in code.)
+
+1. **Data-Integrity** — pulls point-in-time data from free sources (SEC EDGAR for fundamentals and Form 4 insider filings, FRED for macro, yfinance/Stooq for prices), runs fail-loud schema and coverage checks, and quarantines bad rows naming the exact ticker and field rather than dropping them silently.
+2. **Signal-Compute** — computes the locked signals deterministically. Pure, testable math, each component covered by decimal-exact golden cases.
+3. **Backtest/Stats** — labels winners (beat the Nasdaq Composite by ≥15pp over 12 months), builds the two-arm comparison, computes lift, confidence intervals, rank-IC, and walks forward year by year with purge/embargo to prevent overlapping labels from inflating significance.
+4. **Reviewer** — a PR agent that enforces every eval gate on each commit against the architecture spec.
+
+The signals under test are the four with genuine cross-decade evidence: price momentum, earnings-estimate revision breadth, insider cluster buying, and quality/profitability (used as a failure filter) — plus a macro risk-off gate.
+
+---
+
+## What this run does *not* prove (the honest limitations)
+
+I would rather state these plainly than have them found:
+
+- **The universe was 28 hand-picked survivors.** The point-in-time membership adapter that would inject delisted names is still a stub, so this run is survivorship-*aware in design* but survivorship-*biased in data*. Any verdict on this universe is a verdict about the pipeline's correctness, not about the strategy's real edge. A meaningful GO/KILL needs the full universe including delisted tickers.
+- **The sample is far too small for significance.** Five year-slices, ~16–30 names per arm, against a ~300/arm floor. This is why everything reads LOW. It is not a tuning problem; it is a data-volume problem.
+- **Insiders were excluded from this run.** The Form 4 signal needs hundreds of individual SEC fetches and was dropped to get a clean end-to-end result over an unstable connection. It is built and tested, not yet exercised at scale here.
+- **Revision breadth is forward-only.** Historical analyst-estimate snapshots are paywalled, so this signal can be tracked going forward but not backtested historically on free data.
+
+These are the `$0-data` asterisks. The harness surfaces them in every report's coverage and honesty sections rather than hiding them.
+
+---
+
+## What's been validated
+
+- The full pipeline runs end-to-end on real EDGAR / FRED / price data and emits a coherent, evidence-graded verdict.
+- The no-peek chokepoint, filing-lag logic, survivorship test, two-arm structure, and stats calibration each pass with a *non-vacuity proof* — a deliberately planted failure that confirms the guard actually fires.
+- The verdict logic will not round up: a signal that misses any gate is blocked, with the specific blocking reason printed.
+
+## Next phase
+
+A meaningful multi-year verdict requires, in order: a survivorship-free point-in-time universe including delisted names; insiders re-enabled at scale (via SEC's bulk Form 4 index files, which replace thousands of fragile per-filing fetches with one download); and a wider universe across more years. Until then, the result stands as what it is — proof that the machine grades evidence honestly, including when the honest grade is *not enough*.
+
+---
+
+*Built as a free-data ($0 cost) harness. Sources: SEC EDGAR, FRED, yfinance/Stooq. No paid data, no LLM in the run path.*
