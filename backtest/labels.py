@@ -46,7 +46,7 @@ import pandas as pd
 import store as store_pkg
 
 PRICE_FIELD = "close"
-BENCHMARK_TICKER = "NASDAQ_COMP"  # the Nasdaq Composite total-return series in the store
+BENCHMARK_TICKER = "^IXIC"  # Nasdaq Composite (yfinance symbol; Stooq code mapped in data/prices.py)
 HORIZON_MONTHS = 12
 WIN_THRESHOLD_PP = 15.0  # beat the benchmark by >= 15 percentage points
 TOLERANCE_DAYS = 10      # how close to horizon_end a close must be for the window to count

@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from backtest.labels import BENCHMARK_TICKER
 from run import DEFAULT_SIGNALS, PipelineError, RunConfig, SignalSpec, run
 
 YEARS = (2016, 2017, 2018)
@@ -45,7 +46,7 @@ def _build_store(tmp_path, *, with_benchmark=True, n_win=20, n_lose=20):
 
     rows = _path(winners, 0.30) + _path(losers, 0.05)
     if with_benchmark:
-        rows += _path(["NASDAQ_COMP"], 0.10)
+        rows += _path([BENCHMARK_TICKER], 0.10)
     s.put_data(pd.DataFrame(rows))
     return s, winners, losers
 

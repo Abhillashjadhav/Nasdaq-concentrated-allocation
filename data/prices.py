@@ -117,10 +117,29 @@ def _from_yfinance(ticker, start, end):
     return pd.DataFrame({"date": close.index, "close": close.to_numpy()}), "yfinance"
 
 
+# Stooq codes indices differently from US equities (no ".us" suffix). yfinance
+# uses ^-prefixed symbols (e.g. ^IXIC) directly, but Stooq needs its own code.
+STOOQ_INDEX_SYMBOLS = {
+    "^IXIC": "^ndq",   # Nasdaq Composite
+    "^GSPC": "^spx",   # S&P 500
+    "^DJI": "^dji",    # Dow Jones Industrial Average
+}
+
+
+def _stooq_symbol(ticker: str) -> str:
+    """Map a ticker to its Stooq query symbol: index codes for known indices,
+    a best-effort lowercase for other ^-symbols, else the US-equity ``.us`` form."""
+    if ticker in STOOQ_INDEX_SYMBOLS:
+        return STOOQ_INDEX_SYMBOLS[ticker]
+    if ticker.startswith("^"):
+        return ticker.lower()
+    return f"{ticker.lower()}.us"
+
+
 def _from_stooq(ticker, start, end):
     d1 = pd.Timestamp(start).strftime("%Y%m%d")
     d2 = pd.Timestamp(end).strftime("%Y%m%d")
-    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&d1={d1}&d2={d2}&i=d"
+    url = f"https://stooq.com/q/d/l/?s={_stooq_symbol(ticker)}&d1={d1}&d2={d2}&i=d"
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
