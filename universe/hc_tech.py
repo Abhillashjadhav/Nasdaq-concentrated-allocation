@@ -19,6 +19,7 @@ pretend it is survivorship-free.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field as dc_field
 from datetime import date
 
@@ -59,20 +60,29 @@ def _cache_one(store, sym, sic, first_filing) -> None:
 
 
 def classify_and_cache(symbols, *, client, resolver, store, refresh: bool = False,
-                       limit: int | None = None, log_every: int = 50) -> ClassifyResult:
+                       limit: int | None = None, log_every: int = 10) -> ClassifyResult:
     """Resolve+classify each symbol's SIC and cache it in the store INCREMENTALLY
     (each ticker is persisted the moment it is computed, so a restart resumes from
     the store). On a re-run, an already-cached ticker is skipped (no EDGAR call)
     unless ``refresh`` is set. Per-ticker failures are quarantined and the build
     continues; the shared EdgarClient's throttle / 429-Retry-After govern the rate.
-    ``limit`` caps the symbols processed (smoke tests); progress logs every
-    ``log_every`` tickers."""
+    ``limit`` caps the symbols processed (smoke tests); progress is logged AND
+    printed to stdout (so it streams through ``tee``) every ``log_every`` tickers."""
     syms = list(symbols)
     if limit is not None:
         syms = syms[:limit]
     log_every = max(1, log_every)
     total = len(syms)
     res = ClassifyResult(n_symbols=total)
+
+    # Announce work up-front, BEFORE the first EDGAR call, so a long build is never
+    # silent at startup. Read-only pre-scan of the cache; the loop below is unchanged.
+    n_cached_start = 0 if refresh else sum(
+        not store.get_data(SIC_FIELD, s, _FAR_FUTURE).empty for s in syms)
+    print(f"building universe: {total} symbols to classify "
+          f"(cached: {n_cached_start}, to fetch: {total - n_cached_start})", flush=True)
+
+    t0 = time.perf_counter()
     for i, sym in enumerate(syms, 1):
         if not refresh and not store.get_data(SIC_FIELD, sym, _FAR_FUTURE).empty:
             res.n_cached += 1
@@ -98,6 +108,11 @@ def classify_and_cache(symbols, *, client, resolver, store, refresh: bool = Fals
         if i % log_every == 0 or i == total:
             log.info("classified %d/%d (kept %d hc+tech, skipped %d, failed %d)",
                      i, total, res.n_kept, res.n_cached, res.n_quarantined)
+            # Mirror to stdout so the progress streams through the user's `tee`.
+            print(f"classified {i}/{total} (kept {res.n_kept}, skipped {res.n_cached}, "
+                  f"failed {res.n_quarantined}, cache-hits {res.n_cached})", flush=True)
+    print(f"universe build complete: {res.n_kept} names in "
+          f"{time.perf_counter() - t0:.1f}s", flush=True)
     return res
 
 
