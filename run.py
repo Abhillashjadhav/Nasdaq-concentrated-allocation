@@ -169,10 +169,16 @@ def _ingest(config, store) -> list[dict]:
             quarantine.append({"ticker": ticker, "field": "fundamentals",
                                "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
 
+    # Form 4 needs only filings shortly before each entry (the insider lookback is
+    # ~90 days), NOT the wide price window (which reaches back min_year-2 for the
+    # momentum history). Bound it tightly so a 2019-2021 run doesn't pull 2017
+    # filings: from ~6 months before the first entry through the last entry.
+    f4_start = pd.Timestamp(min(config.entry_dates)) - pd.Timedelta(days=180)
+    f4_end = pd.Timestamp(max(config.entry_dates))
     for ticker in config.tickers:
         try:
             res = fetch_insider_buys(ticker, client=edgar, resolver=resolver,
-                                     store=store, write=True, start=start, end=end)
+                                     store=store, write=True, start=f4_start, end=f4_end)
             quarantine.extend(getattr(res, "gaps", []))  # per-filing quarantines surfaced
         except edgar_errs as exc:
             quarantine.append({"ticker": ticker, "field": "form4_buy_P",
@@ -265,7 +271,7 @@ def run(config: RunConfig) -> RunResult:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stockscope",
         description="Winner-signal backtest harness (GO/KILL). See ARCHITECTURE.md.",
@@ -278,10 +284,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default="outputs", help="directory for report.md")
     parser.add_argument("--liquidity-filter", action="store_true")
     parser.add_argument("--ingest", action="store_true", help="call live adapters to populate the store")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--min-obs-per-slice", type=int, default=None,
+        help="override the walk-forward per-slice observation floor (default ~20, "
+             "strict — lower it only for small validation slices)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
 
     from store.store import PITStore
 
+    # Only override the strict default floor when the flag is given.
+    two_arm_kwargs = ({} if args.min_obs_per_slice is None
+                      else {"min_obs_per_slice": args.min_obs_per_slice})
     config = RunConfig(
         store=PITStore(args.db),
         tickers=[t.strip() for t in args.tickers.split(",") if t.strip()],
@@ -290,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output,
         apply_liquidity_filter=args.liquidity_filter,
         ingest=args.ingest,
+        two_arm_kwargs=two_arm_kwargs,
     )
     result = run(config)
     print(f"VERDICT: {result.report.verdict}  ->  {result.report_path}")

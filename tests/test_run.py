@@ -158,3 +158,22 @@ def test_default_registry_adapter_availability():
     assert DEFAULT_SIGNALS["quality"].adapter_available is True
     assert DEFAULT_SIGNALS["revisions"].adapter_available is False
     assert DEFAULT_SIGNALS["insiders"].adapter_available is True  # Form 4 adapter (data/form4.py)
+
+
+def test_cli_has_min_obs_per_slice_flag():
+    from run import _build_parser
+    args = _build_parser().parse_args(["--db", "x", "--tickers", "A", "--min-obs-per-slice", "5"])
+    assert args.min_obs_per_slice == 5
+    assert _build_parser().parse_args(["--db", "x", "--tickers", "A"]).min_obs_per_slice is None
+
+
+def test_min_obs_per_slice_override_allows_small_slice(tmp_path):
+    store, winners, losers = _build_store(tmp_path, n_win=3, n_lose=2)  # 5 obs per year
+    # the strict default floor (~20) skips every small slice -> nothing evaluable
+    with pytest.raises(PipelineError):
+        run(_config(tmp_path, store, winners, losers, min_samples_per_arm=3,
+                    two_arm_kwargs={"threshold": 60.0, "n_boot": 100}))
+    # lowering the floor lets the small slice evaluate and produce a verdict
+    res = run(_config(tmp_path, store, winners, losers, min_samples_per_arm=3,
+                      two_arm_kwargs={"threshold": 60.0, "n_boot": 100, "min_obs_per_slice": 4}))
+    assert res.report.verdict in {"GO", "MARGINAL", "KILL"}

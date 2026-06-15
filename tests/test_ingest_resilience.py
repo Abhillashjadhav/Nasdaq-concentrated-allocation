@@ -120,3 +120,34 @@ def test_ingest_shares_one_edgar_client_across_tickers(tmp_path, monkeypatch):
     assert len({id(c) for c in clients}) == 1            # one shared client across tickers
     assert all(isinstance(r, CikResolver) for r in resolvers)
     assert len({id(r) for r in resolvers}) == 1          # one shared resolver too
+
+
+def test_ingest_form4_window_excludes_far_history(tmp_path, monkeypatch):
+    """Form 4 is bounded to ~6 months before the first entry through the last entry,
+    NOT the wide price window — a 2019-2021 run must not reach back to 2017."""
+    import pandas as pd
+    monkeypatch.setenv("STOCKSCOPE_SEC_USER_AGENT", "test test@example.com")
+    monkeypatch.setattr(prices_mod, "fetch_prices", _fake_prices)
+    monkeypatch.setattr(fundamentals_mod, "fetch_fundamentals", lambda *a, **k: None)
+
+    captured = {}
+
+    class _R:
+        gaps: list = []
+
+    def cap_form4(ticker, *, start=None, end=None, **k):
+        captured["start"], captured["end"] = start, end
+        return _R()
+
+    monkeypatch.setattr(form4_mod, "fetch_insider_buys", cap_form4)
+
+    store = PITStore(tmp_path / "f4win.sqlite")
+    cfg = RunConfig(store=store, tickers=["AAA"],
+                    entry_dates=[date(2019, 1, 1), date(2020, 1, 1), date(2021, 1, 1)],
+                    active_signals=["momentum"], output_dir="/tmp/_f4win", ingest=True)
+    _ingest(cfg, store)
+
+    s, e = pd.Timestamp(captured["start"]), pd.Timestamp(captured["end"])
+    assert s >= pd.Timestamp("2018-01-01")   # NOT 2017 (the price window's start)
+    assert s < pd.Timestamp("2019-01-01")    # before the first entry (covers the insider lookback)
+    assert e == pd.Timestamp("2021-01-01")   # the last entry
