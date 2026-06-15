@@ -42,7 +42,11 @@ DEFAULT_BASE_DELAY = 1.0
 SOURCE = "fred"
 MACRO_TICKER = "MACRO"
 
-# field -> (FRED series id, publication lag in days). Field names match macro.regime.
+# field -> (FRED series id, publication lag in BUSINESS days). Field names match
+# macro.regime. A business-day lag avoids exposing a Friday print on Sat/Sun
+# before its actual next-business-day release (holidays are a future refinement).
+# Note: this ingests FRED's latest vintage, not ALFRED point-in-time vintages, so
+# later revisions are not modelled — acceptable for the coarse regime gate.
 SERIES = {
     "hy_oas": ("BAMLH0A0HYM2", 1),       # ICE BofA US High Yield OAS (daily)
     "fed_funds_rate": ("DFF", 1),        # daily effective federal funds rate
@@ -115,7 +119,14 @@ class FredClient:
                 last_exc = exc
                 if attempt < self.retries - 1:
                     self._sleep(self.base_delay * (2 ** attempt))
-        raise FredHTTPError(f"FRED request failed for {series_id}: {last_exc}") from last_exc
+        # The api_key rides in the query string, so the underlying error (and its
+        # URL) can carry it. Redact the key and suppress the chained cause so it
+        # never reaches logs/tracebacks (CLAUDE.md: a logged secret is a hard reject).
+        detail = str(last_exc).replace(self.api_key, "***")
+        status = getattr(getattr(last_exc, "response", None), "status_code", None)
+        raise FredHTTPError(
+            f"FRED request failed for {series_id} (status={status}): {detail}"
+        ) from None
 
 
 @dataclass
@@ -140,23 +151,23 @@ def fetch_macro(
 
     rows: list[dict] = []
     gaps: list[dict] = []
-    for field in fields:
-        series_id, lag_days = SERIES[field]
+    for name in fields:
+        series_id, lag_bdays = SERIES[name]
         data = client.get_observations(series_id, observation_start=observation_start)
         usable = [
             o for o in data.get("observations", [])
             if o.get("date") and o.get("value") not in (None, ".", "")
         ]
         if not usable:
-            gaps.append({"ticker": MACRO_TICKER, "field": field,
+            gaps.append({"ticker": MACRO_TICKER, "field": name,
                          "reason": "no_fred_observations", "vendor": SOURCE})
             continue
         for o in usable:
             event_date = pd.Timestamp(o["date"])
             rows.append({
-                "ticker": MACRO_TICKER, "field": field, "value": float(o["value"]),
+                "ticker": MACRO_TICKER, "field": name, "value": float(o["value"]),
                 "event_date": event_date,
-                "knowledge_date": event_date + pd.Timedelta(days=lag_days),
+                "knowledge_date": event_date + pd.offsets.BusinessDay(lag_bdays),
                 "source": SOURCE,
             })
 

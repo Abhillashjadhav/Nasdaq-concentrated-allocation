@@ -19,6 +19,7 @@ from data.fred import (
     SERIES,
     FredClient,
     FredConfigError,
+    FredHTTPError,
     fetch_macro,
 )
 from store.store import PITStore
@@ -74,6 +75,32 @@ def test_missing_series_flagged_not_zeroed():
     assert res.records.empty
     assert any(g["field"] == "fed_funds_rate" and g["reason"] == "no_fred_observations"
                for g in res.gaps)
+
+
+def test_business_day_lag_skips_weekend(tmp_path):
+    # a Friday (2020-03-27) observation must not be visible until its Monday release
+    fake = FakeFredClient({"VIXCLS": _obs([("2020-03-27", "20.0")])})
+    store = PITStore(tmp_path / "bday.sqlite")
+    fetch_macro(client=fake, fields=["vix"], store=store, write=True)
+    assert store.get_data("vix", MACRO_TICKER, date(2020, 3, 29)).empty       # Sunday
+    assert len(store.get_data("vix", MACRO_TICKER, date(2020, 3, 30))) == 1   # Monday
+
+
+class _KeyLeakSession:
+    """Simulates requests surfacing the full URL (with api_key) in the error."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        full = f"{url}?series_id={params['series_id']}&api_key={params['api_key']}"
+        raise RuntimeError(f"500 Server Error for url: {full}")
+
+
+def test_api_key_never_leaks_into_error():
+    c = FredClient(api_key="SECRETKEY123", session=_KeyLeakSession(),
+                   retries=1, sleep=lambda *_: None)
+    with pytest.raises(FredHTTPError) as ei:
+        c.get_observations("BAMLH0A0HYM2")
+    assert "SECRETKEY123" not in str(ei.value)        # redacted from the message
+    assert ei.value.__cause__ is None                 # chained cause suppressed
 
 
 def test_missing_api_key_fails_loud(monkeypatch):
