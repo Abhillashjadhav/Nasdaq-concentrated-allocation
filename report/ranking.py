@@ -12,7 +12,7 @@ NOT a win probability, and every table header says so.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from datetime import date
 from statistics import mean
 from typing import Callable
