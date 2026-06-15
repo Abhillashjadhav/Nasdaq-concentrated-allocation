@@ -120,6 +120,8 @@ def _ingest(config, store) -> list[dict]:
     transient failure quarantines that ticker's data for that source, never aborts).
     Config errors (e.g. a missing SEC User-Agent) still propagate — that is setup,
     not a per-ticker data gap. Returns the quarantine records (evals.coverage shape)."""
+    # Local imports keep network deps out of import time AND make the adapters
+    # monkeypatchable per-call in tests (rebound from their modules each call).
     from data.edgar_client import EdgarHTTPError, UnknownTickerError  # per-ticker EDGAR errors
     from data.form4 import fetch_insider_buys
     from data.fundamentals import fetch_fundamentals  # local import: network deps
@@ -162,7 +164,8 @@ def _ingest(config, store) -> list[dict]:
 
     for ticker in config.tickers:
         try:
-            fetch_insider_buys(ticker, store=store, write=True)
+            res = fetch_insider_buys(ticker, store=store, write=True)
+            quarantine.extend(getattr(res, "gaps", []))  # per-filing quarantines surfaced
         except edgar_errs as exc:
             quarantine.append({"ticker": ticker, "field": "form4_buy_P",
                                "reason": f"form4_unavailable: {exc}", "vendor": "edgar"})

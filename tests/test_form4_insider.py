@@ -139,6 +139,48 @@ def test_p_disposal_not_counted_as_buy():
     assert "form4_other_P" in set(res.records["field"])
 
 
+MALFORMED_XML = "<ownershipDocument><reportingOwner><rptOwnerCik>42</rptOwnerCik>"  # truncated/mismatched
+
+SUBMISSIONS_TWO = {"filings": {"recent": {
+    "form": ["4", "4"],
+    "accessionNumber": ["0001112223-21-000045", "0009999999-21-000099"],
+    "filingDate": ["2021-02-03", "2021-03-10"],
+    "primaryDocument": ["form4.xml", "bad4.xml"],
+}}}
+
+
+def test_malformed_filing_quarantined_valid_survives():
+    """A truncated/malformed Form 4 quarantines THAT filing; the valid one still
+    parses and ingests — one bad filing is never fatal."""
+    fake = FakeClient(
+        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS_TWO},
+        {"form4.xml": FORM4_XML, "bad4.xml": MALFORMED_XML},
+    )
+    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+
+    # the valid filing produced the open-market buy
+    assert (res.records["field"] == BUY_FIELD).sum() == 1
+    # the malformed filing is quarantined with a reason naming the parse failure
+    assert any("form4_parse_error" in g["reason"] for g in res.gaps)
+
+
+def test_non_xml_response_quarantined_not_parsed():
+    """An HTML/error page (non-XML) is detected and quarantined, never fed to ET."""
+    fake = FakeClient(
+        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS},
+        {"form4.xml": "<!DOCTYPE html><html><body>SEC error</body></html>"},
+    )
+    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+    assert res.records.empty
+    assert any("form4_non_xml_response" in g["reason"] for g in res.gaps)
+
+
+def test_parse_form4_raises_on_malformed():
+    import xml.etree.ElementTree as ET
+    with pytest.raises(ET.ParseError):
+        parse_form4(MALFORMED_XML)
+
+
 def test_fields_align_with_insider_signal():
     from signals.insider import BUY_FIELD as SIG_BUY, COVERAGE_FIELD as SIG_COV
     assert (BUY_FIELD, COVERAGE_FIELD) == (SIG_BUY, SIG_COV)
