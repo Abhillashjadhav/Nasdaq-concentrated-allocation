@@ -63,14 +63,14 @@ def _wrap(fn):
     return scorer
 
 
-# Default registry. momentum (prices adapter) and quality (EDGAR adapter) have a
-# live ingest path; revisions (estimate snapshots) and insiders (Form 4) do not
-# yet, so they are marked not_run until their adapters land.
+# Default registry. momentum (prices adapter), quality (EDGAR adapter) and
+# insiders (Form 4 adapter, data/form4.py) have a live ingest path; revisions
+# (estimate snapshots) does not yet, so it is marked not_run until its adapter lands.
 DEFAULT_SIGNALS: dict[str, SignalSpec] = {
     "momentum": SignalSpec("momentum", _wrap(momentum_score), adapter_available=True),
     "quality": SignalSpec("quality", _wrap(quality_score), adapter_available=True),
     "revisions": SignalSpec("revisions", _wrap(revision_breadth_score), adapter_available=False),
-    "insiders": SignalSpec("insiders", _wrap(insider_cluster_score), adapter_available=False),
+    "insiders": SignalSpec("insiders", _wrap(insider_cluster_score), adapter_available=True),
 }
 
 
