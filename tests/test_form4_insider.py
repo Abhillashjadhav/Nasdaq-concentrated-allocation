@@ -67,11 +67,26 @@ class FakeClient:
         raise KeyError(path)
 
 
-def _fake(submissions=SUBMISSIONS):
-    fake = FakeClient(
-        {"company_tickers": COMPANY_TICKERS, "submissions": submissions},
-        {"form4.xml": FORM4_XML},
-    )
+def _index(xml_name):
+    """A filing index.json directory: the ownership .xml plus an HTML render that
+    the adapter must ignore."""
+    return {"directory": {"item": [
+        {"name": f"xslF345X05/{xml_name.replace('.xml', '.html')}", "type": "4"},  # XSL render
+        {"name": xml_name, "type": "4"},                                           # raw XML
+        {"name": "0001-index.htm", "type": "index"},
+    ]}}
+
+
+def _index_map(submissions):
+    from data.form4 import _form4_filings
+    return {accn.replace("-", ""): _index(doc)
+            for accn, _fdate, doc in _form4_filings(submissions)}
+
+
+def _fake(submissions=SUBMISSIONS, texts=None):
+    json_resp = {"company_tickers": COMPANY_TICKERS, "submissions": submissions}
+    json_resp.update(_index_map(submissions))  # per-accession index.json
+    fake = FakeClient(json_resp, texts or {"form4.xml": FORM4_XML})
     return fake, CikResolver(fake)
 
 
@@ -130,11 +145,8 @@ def test_p_disposal_not_counted_as_buy():
     </nonDerivativeTransaction>
   </nonDerivativeTable>
 </ownershipDocument>"""
-    fake = FakeClient(
-        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS},
-        {"form4.xml": xml},
-    )
-    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+    fake, resolver = _fake(SUBMISSIONS, texts={"form4.xml": xml})
+    res = fetch_insider_buys("AAPL", client=fake, resolver=resolver)
     assert (res.records["field"] == BUY_FIELD).sum() == 0
     assert "form4_other_P" in set(res.records["field"])
 
@@ -152,11 +164,8 @@ SUBMISSIONS_TWO = {"filings": {"recent": {
 def test_malformed_filing_quarantined_valid_survives():
     """A truncated/malformed Form 4 quarantines THAT filing; the valid one still
     parses and ingests — one bad filing is never fatal."""
-    fake = FakeClient(
-        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS_TWO},
-        {"form4.xml": FORM4_XML, "bad4.xml": MALFORMED_XML},
-    )
-    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+    fake, resolver = _fake(SUBMISSIONS_TWO, texts={"form4.xml": FORM4_XML, "bad4.xml": MALFORMED_XML})
+    res = fetch_insider_buys("AAPL", client=fake, resolver=resolver)
 
     # the valid filing produced the open-market buy
     assert (res.records["field"] == BUY_FIELD).sum() == 1
@@ -166,13 +175,38 @@ def test_malformed_filing_quarantined_valid_survives():
 
 def test_non_xml_response_quarantined_not_parsed():
     """An HTML/error page (non-XML) is detected and quarantined, never fed to ET."""
-    fake = FakeClient(
-        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS},
-        {"form4.xml": "<!DOCTYPE html><html><body>SEC error</body></html>"},
-    )
-    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+    fake, resolver = _fake(SUBMISSIONS,
+                           texts={"form4.xml": "<!DOCTYPE html><html><body>SEC error</body></html>"})
+    res = fetch_insider_buys("AAPL", client=fake, resolver=resolver)
     assert res.records.empty
     assert any("form4_non_xml_response" in g["reason"] for g in res.gaps)
+
+
+def test_ownership_xml_url_picks_xml_not_html():
+    """The resolver must return the raw .xml inside the filing, not the XSL/HTML render."""
+    from data.form4 import _ownership_xml_url
+    client = FakeClient({"index.json": _index("primary_doc.xml")}, {})
+    url = _ownership_xml_url(client, 320193, "000111222321000045")
+    assert url.endswith("/primary_doc.xml")
+    assert ".htm" not in url and "xsl" not in url.lower()
+
+
+def test_window_filters_out_of_range_filings():
+    """Only filings whose date is in [start, end] are fetched (don't pull all history)."""
+    fake, resolver = _fake(SUBMISSIONS_TWO, texts={"form4.xml": FORM4_XML, "bad4.xml": MALFORMED_XML})
+    res = fetch_insider_buys("AAPL", client=fake, resolver=resolver,
+                             start=date(2021, 1, 1), end=date(2021, 2, 28))  # excludes the 03-10 filing
+    assert (res.records["field"] == BUY_FIELD).sum() == 1            # only the in-window valid filing
+    assert not any("parse_error" in g["reason"] for g in res.gaps)   # the malformed 03-10 filing was skipped
+
+
+def test_all_filings_unparseable_logs_loudly(caplog):
+    """If every in-window filing yields non-XML after the URL fix, log it loudly."""
+    import logging
+    fake, resolver = _fake(SUBMISSIONS, texts={"form4.xml": "<html>error</html>"})
+    with caplog.at_level(logging.ERROR):
+        fetch_insider_buys("AAPL", client=fake, resolver=resolver)
+    assert any("ZERO ownership" in r.message for r in caplog.records)
 
 
 def test_parse_form4_raises_on_malformed():
