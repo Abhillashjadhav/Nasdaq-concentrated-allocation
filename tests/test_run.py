@@ -142,11 +142,11 @@ def test_fail_loud_when_required_input_missing(tmp_path):
 
 def test_fail_loud_when_no_runnable_signal(tmp_path):
     store, winners, losers = _build_store(tmp_path)
-    # both active signals lack a live adapter (default registry) -> refuse to run
+    # revisions is the only signal with no live adapter (default registry) -> refuse to run
     cfg = RunConfig(
         store=store, tickers=winners + losers,
         entry_dates=[date(y, 1, 1) for y in YEARS],
-        active_signals=["revisions", "insiders"], output_dir=str(tmp_path / "out2"),
+        active_signals=["revisions"], output_dir=str(tmp_path / "out2"),
     )
     with pytest.raises(PipelineError):
         run(cfg)
