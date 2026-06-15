@@ -156,4 +156,4 @@ def test_default_registry_adapter_availability():
     assert DEFAULT_SIGNALS["momentum"].adapter_available is True
     assert DEFAULT_SIGNALS["quality"].adapter_available is True
     assert DEFAULT_SIGNALS["revisions"].adapter_available is False
-    assert DEFAULT_SIGNALS["insiders"].adapter_available is False
+    assert DEFAULT_SIGNALS["insiders"].adapter_available is True  # Form 4 adapter (data/form4.py)
