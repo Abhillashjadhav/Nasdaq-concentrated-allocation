@@ -40,6 +40,7 @@ class Form4Txn:
     code: str | None
     date: str | None
     is_derivative: bool
+    acquired_disposed: str | None = None  # "A" acquired / "D" disposed
 
 
 @dataclass
@@ -83,6 +84,7 @@ def parse_form4(xml_text: str) -> tuple[str | None, list[Form4Txn]]:
                 code=_value(node, "transactionCode"),
                 date=_value(node, "transactionDate"),
                 is_derivative=is_deriv,
+                acquired_disposed=_value(node, "transactionAcquiredDisposedCode"),
             ))
     return owner_cik, txns
 
@@ -135,9 +137,11 @@ def fetch_insider_buys(
         for t in txns:
             if t.code is None or t.date is None:
                 continue
-            # open-market buy (code P, non-derivative) -> the cluster field; every
-            # other code is routed elsewhere so it cannot inflate the cluster.
-            f = BUY_FIELD if (t.code == "P" and not t.is_derivative) else f"form4_other_{t.code}"
+            # open-market buy (code P, non-derivative, an acquisition) -> the cluster
+            # field; every other code/direction is routed elsewhere so it cannot
+            # inflate the cluster. (A P-disposal would be malformed; guard anyway.)
+            is_buy = t.code == "P" and not t.is_derivative and t.acquired_disposed != "D"
+            f = BUY_FIELD if is_buy else f"form4_other_{t.code}"
             rows.append({"ticker": ticker.upper(), "field": f, "value": float(owner_cik),
                          "event_date": pd.Timestamp(t.date), "knowledge_date": kd,
                          "source": SOURCE})

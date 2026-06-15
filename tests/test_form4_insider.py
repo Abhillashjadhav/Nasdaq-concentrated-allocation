@@ -117,6 +117,28 @@ def test_no_form4_filings_flagged_not_faked():
                for g in res.gaps)
 
 
+def test_p_disposal_not_counted_as_buy():
+    # a malformed code-P that is a DISPOSAL must not land in the buy field
+    xml = """<?xml version="1.0"?>
+<ownershipDocument>
+  <reportingOwner><reportingOwnerId><rptOwnerCik>0000009999</rptOwnerCik></reportingOwnerId></reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <transactionDate><value>2021-02-01</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionAmounts><transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode></transactionAmounts>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"""
+    fake = FakeClient(
+        {"company_tickers": COMPANY_TICKERS, "submissions": SUBMISSIONS},
+        {"form4.xml": xml},
+    )
+    res = fetch_insider_buys("AAPL", client=fake, resolver=CikResolver(fake))
+    assert (res.records["field"] == BUY_FIELD).sum() == 0
+    assert "form4_other_P" in set(res.records["field"])
+
+
 def test_fields_align_with_insider_signal():
     from signals.insider import BUY_FIELD as SIG_BUY, COVERAGE_FIELD as SIG_COV
     assert (BUY_FIELD, COVERAGE_FIELD) == (SIG_BUY, SIG_COV)
