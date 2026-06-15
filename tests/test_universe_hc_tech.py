@@ -155,3 +155,18 @@ def test_progress_logging(tmp_path, caplog):
                            store=store, log_every=1)
     msgs = [r.getMessage() for r in caplog.records]
     assert any("classified" in m and "kept" in m and "failed" in m for m in msgs)
+
+
+def test_progress_streams_to_stdout(tmp_path, capsys):
+    """Progress must reach STDOUT (not only the logging module) so it streams
+    through the user's `tee` — a startup line before the first EDGAR call and a
+    per-batch progress line."""
+    store = PITStore(tmp_path / "stdout.sqlite")
+    fake = FakeClient()
+    classify_and_cache(["TECHX", "HEALX"], client=fake, resolver=CikResolver(fake),
+                       store=store, log_every=1)
+    out = capsys.readouterr().out
+    assert "building universe: 2 symbols to classify" in out  # startup, no silent gap
+    assert "cached: 0, to fetch: 2" in out
+    assert "classified 1/2" in out and "cache-hits" in out     # a progress line streamed
+    assert "universe build complete:" in out                   # completion line
