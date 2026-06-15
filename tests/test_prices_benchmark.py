@@ -41,7 +41,8 @@ def test_index_benchmark_uses_stooq_index_code(monkeypatch):
         captured["url"] = url
         return _Resp()
 
-    # yfinance isn't installed here, so the fetch falls through to Stooq.
+    # force the Stooq fallback explicitly (don't depend on yfinance being absent)
+    monkeypatch.setattr(prices, "_from_yfinance", lambda *a: (None, "yfinance"))
     monkeypatch.setattr(prices.requests, "get", fake_get)
     recs = fetch_prices("^IXIC", date(2020, 1, 1), date(2020, 1, 3),
                         retries=1, sleep=lambda *_: None)
@@ -55,6 +56,7 @@ def test_index_benchmark_uses_stooq_index_code(monkeypatch):
 
 def test_equity_still_uses_us_suffix(monkeypatch):
     captured = {}
+    monkeypatch.setattr(prices, "_from_yfinance", lambda *a: (None, "yfinance"))
     monkeypatch.setattr(prices.requests, "get",
                         lambda url, timeout=None: captured.update(url=url) or _Resp())
     fetch_prices("AAPL", date(2020, 1, 1), date(2020, 1, 3),
