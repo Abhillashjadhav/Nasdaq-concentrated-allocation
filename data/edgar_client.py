@@ -23,9 +23,21 @@ import requests
 DEFAULT_BASE_URL = "https://data.sec.gov"
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 USER_AGENT_ENV = "STOCKSCOPE_SEC_USER_AGENT"
-MIN_INTERVAL_SECONDS = 0.1  # <=10 requests/second
+MIN_INTERVAL_SECONDS = 0.125  # ~8 requests/second — under SEC's ~10/s limit, with margin
 DEFAULT_RETRIES = 3
 DEFAULT_BASE_DELAY = 1.0
+
+
+def _parse_retry_after(headers) -> float | None:
+    """Parse a Retry-After header (delta-seconds form). Returns None for an absent
+    or HTTP-date value, so the caller falls back to exponential backoff."""
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class EdgarConfigError(RuntimeError):
@@ -80,7 +92,9 @@ class EdgarClient:
 
     def _get(self, path_or_url: str):
         """GET an EDGAR path (or absolute URL), throttled and retried; returns the
-        response. Raises ``EdgarHTTPError`` after exhausting retries."""
+        response. A 429 (rate limited) is retryable — back off honoring Retry-After
+        when present, else exponential — never a hard failure on the first hit.
+        Raises ``EdgarHTTPError`` after exhausting retries."""
         url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
         headers = {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
         last_exc = None
@@ -90,11 +104,21 @@ class EdgarClient:
                 resp = self._session.get(url, headers=headers, timeout=30)
                 resp.raise_for_status()
                 return resp
-            except Exception as exc:  # transport/HTTP -> retry then fail loud
+            except Exception as exc:  # transport/HTTP (incl. 429) -> retry then fail loud
                 last_exc = exc
                 if attempt < self.retries - 1:
-                    self._sleep(self.base_delay * (2 ** attempt))
+                    self._sleep(self._backoff_seconds(exc, attempt))
         raise EdgarHTTPError(f"EDGAR request failed for {url}: {last_exc}") from last_exc
+
+    def _backoff_seconds(self, exc, attempt: int) -> float:
+        """Seconds to wait before retrying. A 429 honors the server's Retry-After
+        header when present ('slow down', not 'bad request'); otherwise exponential."""
+        resp = getattr(exc, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            retry_after = _parse_retry_after(getattr(resp, "headers", None) or {})
+            if retry_after is not None:
+                return retry_after
+        return self.base_delay * (2 ** attempt)
 
     def get_json(self, path_or_url: str):
         """GET JSON from an EDGAR path (or absolute URL), throttled and retried."""

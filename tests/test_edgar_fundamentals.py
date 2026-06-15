@@ -12,10 +12,12 @@ from datetime import date
 
 import pandas as pd
 import pytest
+import requests
 
 from data.edgar_client import (
     EdgarClient,
     EdgarConfigError,
+    MIN_INTERVAL_SECONDS,
     UnknownTickerError,
     USER_AGENT_ENV,
     CikResolver,
@@ -219,6 +221,76 @@ def test_get_json_retries_then_succeeds():
                     sleep=lambda *_: None)
     assert c.get_json("/x")["ok"] is True
     assert session.n == 3  # failed twice, succeeded on the third
+
+
+def test_throttle_default_is_under_10_per_sec():
+    assert MIN_INTERVAL_SECONDS >= 0.125  # ~8 req/s, with margin under SEC's ~10/s
+
+
+class _Resp429:
+    def __init__(self, retry_after=None):
+        self.status_code = 429
+        self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+    def raise_for_status(self):
+        err = requests.exceptions.HTTPError("429 Too Many Requests")
+        err.response = self  # status_code + headers visible to the backoff logic
+        raise err
+
+
+class _Resp200:
+    status_code = 200
+    headers = {}
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"ok": True}
+
+    @property
+    def text(self):
+        return "<ownershipDocument/>"
+
+
+class _Rate429Session:
+    """429 (with optional Retry-After) on the first N calls, then 200."""
+
+    def __init__(self, n_429, retry_after=None):
+        self.n_429, self.retry_after, self.n = n_429, retry_after, 0
+
+    def get(self, url, headers=None, timeout=None):
+        self.n += 1
+        return _Resp429(self.retry_after) if self.n <= self.n_429 else _Resp200()
+
+
+def test_429_is_retryable_and_honors_retry_after():
+    slept = []
+    session = _Rate429Session(n_429=1, retry_after="2")
+    c = EdgarClient(user_agent="t t@e.com", session=session, base_delay=1.0,
+                    sleep=slept.append, clock=lambda: 0.0)
+    assert c.get_json("/x") == {"ok": True}   # backed off and recovered, not quarantined
+    assert session.n == 2                      # one 429, then success
+    assert 2.0 in slept                        # honored Retry-After (not exponential 1.0)
+
+
+def test_429_without_retry_after_uses_exponential_backoff():
+    slept = []
+    session = _Rate429Session(n_429=1, retry_after=None)
+    c = EdgarClient(user_agent="t t@e.com", session=session, base_delay=1.0,
+                    sleep=slept.append, clock=lambda: 0.0)
+    assert c.get_json("/x") == {"ok": True}
+    assert 1.0 in slept                        # exponential fallback (base_delay * 2**0)
+
+
+def test_throttle_covers_get_text():
+    # the .xml path (get_text) goes through the same throttled _get as get_json
+    slept = []
+    c = EdgarClient(user_agent="t t@e.com", session=_Rate429Session(n_429=0),
+                    min_interval=0.125, sleep=slept.append, clock=lambda: 0.0)
+    c.get_json("/a")
+    c.get_text("/b")
+    assert any(s == pytest.approx(0.125, abs=1e-9) for s in slept)  # throttled between calls
 
 
 # --- alignment + live smoke ---------------------------------------------------
