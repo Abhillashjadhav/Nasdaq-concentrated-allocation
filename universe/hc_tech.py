@@ -37,7 +37,8 @@ _FAR_FUTURE = date(2100, 1, 1)  # "is this symbol classified at all?" probe
 @dataclass
 class ClassifyResult:
     n_symbols: int = 0
-    n_classified: int = 0      # newly cached this run
+    n_classified: int = 0      # newly fetched + cached this run (any SIC)
+    n_kept: int = 0            # of those, in-scope (technology/healthcare)
     n_cached: int = 0          # already in the store (skipped)
     n_quarantined: int = 0
     quarantine: list[dict] = dc_field(default_factory=list)
@@ -48,37 +49,54 @@ def _earliest_filing_date(submissions: dict):
     return min(fdates) if fdates else None
 
 
-def classify_and_cache(symbols, *, client, resolver, store) -> ClassifyResult:
-    """Resolve+classify each symbol's SIC and cache it in the store (idempotent:
-    symbols already cached are skipped). Failures are quarantined, never fatal."""
-    res = ClassifyResult(n_symbols=len(symbols))
-    rows = []
-    for sym in symbols:
-        if not store.get_data(SIC_FIELD, sym, _FAR_FUTURE).empty:
+def _cache_one(store, sym, sic, first_filing) -> None:
+    """Persist ONE ticker's SIC to the store immediately (incremental cache)."""
+    kd = pd.Timestamp(first_filing)
+    store.put_data(pd.DataFrame([{
+        "ticker": sym, "field": SIC_FIELD, "value": float(int(sic)),
+        "event_date": kd, "knowledge_date": kd, "source": SOURCE,
+    }], columns=COLUMNS))
+
+
+def classify_and_cache(symbols, *, client, resolver, store, refresh: bool = False,
+                       limit: int | None = None, log_every: int = 50) -> ClassifyResult:
+    """Resolve+classify each symbol's SIC and cache it in the store INCREMENTALLY
+    (each ticker is persisted the moment it is computed, so a restart resumes from
+    the store). On a re-run, an already-cached ticker is skipped (no EDGAR call)
+    unless ``refresh`` is set. Per-ticker failures are quarantined and the build
+    continues; the shared EdgarClient's throttle / 429-Retry-After govern the rate.
+    ``limit`` caps the symbols processed (smoke tests); progress logs every
+    ``log_every`` tickers."""
+    syms = list(symbols)
+    if limit is not None:
+        syms = syms[:limit]
+    total = len(syms)
+    res = ClassifyResult(n_symbols=total)
+    for i, sym in enumerate(syms, 1):
+        if not refresh and not store.get_data(SIC_FIELD, sym, _FAR_FUTURE).empty:
             res.n_cached += 1
-            continue
-        try:
-            cik = resolver.resolve(sym)
-            submissions = client.get_json(f"/submissions/CIK{cik}.json")
-            sic = submissions.get("sic") or submissions.get("sicCode")
-            first_filing = _earliest_filing_date(submissions)
-            if not sic or first_filing is None:
+        else:
+            try:
+                cik = resolver.resolve(sym)
+                submissions = client.get_json(f"/submissions/CIK{cik}.json")
+                sic = submissions.get("sic") or submissions.get("sicCode")
+                first_filing = _earliest_filing_date(submissions)
+                if not sic or first_filing is None:
+                    res.n_quarantined += 1
+                    res.quarantine.append({"ticker": sym, "field": SIC_FIELD,
+                                           "reason": "no_sic_or_filing", "vendor": SOURCE})
+                else:
+                    _cache_one(store, sym, sic, first_filing)  # persist immediately
+                    res.n_classified += 1
+                    if classify_sic(float(int(sic))) is not None:
+                        res.n_kept += 1
+            except (UnknownTickerError, EdgarHTTPError) as exc:  # timeout/4xx/parse -> skip
                 res.n_quarantined += 1
                 res.quarantine.append({"ticker": sym, "field": SIC_FIELD,
-                                       "reason": "no_sic_or_filing", "vendor": SOURCE})
-                continue
-            kd = pd.Timestamp(first_filing)
-            rows.append({"ticker": sym, "field": SIC_FIELD, "value": float(int(sic)),
-                         "event_date": kd, "knowledge_date": kd, "source": SOURCE})
-            res.n_classified += 1
-        except (UnknownTickerError, EdgarHTTPError) as exc:
-            res.n_quarantined += 1
-            res.quarantine.append({"ticker": sym, "field": SIC_FIELD,
-                                   "reason": f"sic_unavailable: {exc}", "vendor": SOURCE})
-    if rows:
-        store.put_data(pd.DataFrame(rows, columns=COLUMNS))
-    log.info("universe classify: %d symbols, %d newly classified, %d cached, %d quarantined",
-             res.n_symbols, res.n_classified, res.n_cached, res.n_quarantined)
+                                       "reason": f"sic_unavailable: {exc}", "vendor": SOURCE})
+        if i % log_every == 0 or i == total:
+            log.info("classified %d/%d (kept %d hc+tech, skipped %d, failed %d)",
+                     i, total, res.n_kept, res.n_cached, res.n_quarantined)
     return res
 
 
