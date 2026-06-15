@@ -78,9 +78,9 @@ class EdgarClient:
                 self._sleep(wait)
         self._last_request = self._clock()
 
-    def get_json(self, path_or_url: str):
-        """GET JSON from an EDGAR path (or absolute URL), throttled and retried.
-        Raises ``EdgarHTTPError`` after exhausting retries."""
+    def _get(self, path_or_url: str):
+        """GET an EDGAR path (or absolute URL), throttled and retried; returns the
+        response. Raises ``EdgarHTTPError`` after exhausting retries."""
         url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
         headers = {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
         last_exc = None
@@ -89,12 +89,20 @@ class EdgarClient:
             try:
                 resp = self._session.get(url, headers=headers, timeout=30)
                 resp.raise_for_status()
-                return resp.json()
-            except Exception as exc:  # transport/HTTP/parse -> retry then fail loud
+                return resp
+            except Exception as exc:  # transport/HTTP -> retry then fail loud
                 last_exc = exc
                 if attempt < self.retries - 1:
                     self._sleep(self.base_delay * (2 ** attempt))
         raise EdgarHTTPError(f"EDGAR request failed for {url}: {last_exc}") from last_exc
+
+    def get_json(self, path_or_url: str):
+        """GET JSON from an EDGAR path (or absolute URL), throttled and retried."""
+        return self._get(path_or_url).json()
+
+    def get_text(self, path_or_url: str) -> str:
+        """GET text (e.g. a Form 4 ownership XML), throttled and retried."""
+        return self._get(path_or_url).text
 
 
 class CikResolver:
