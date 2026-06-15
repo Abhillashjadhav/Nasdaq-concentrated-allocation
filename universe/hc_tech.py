@@ -70,6 +70,7 @@ def classify_and_cache(symbols, *, client, resolver, store, refresh: bool = Fals
     syms = list(symbols)
     if limit is not None:
         syms = syms[:limit]
+    log_every = max(1, log_every)
     total = len(syms)
     res = ClassifyResult(n_symbols=total)
     for i, sym in enumerate(syms, 1):
