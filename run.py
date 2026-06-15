@@ -164,7 +164,8 @@ def _ingest(config, store) -> list[dict]:
 
     for ticker in config.tickers:
         try:
-            fetch_insider_buys(ticker, store=store, write=True)
+            res = fetch_insider_buys(ticker, store=store, write=True)
+            quarantine.extend(getattr(res, "gaps", []))  # per-filing quarantines surfaced
         except edgar_errs as exc:
             quarantine.append({"ticker": ticker, "field": "form4_buy_P",
                                "reason": f"form4_unavailable: {exc}", "vendor": "edgar"})

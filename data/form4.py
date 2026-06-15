@@ -20,15 +20,17 @@ names match ``signals.insider`` (guarded by a test). Records are written through
 
 from __future__ import annotations
 
+import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field as dc_field
 
 import pandas as pd
 
 import store as store_pkg
-from data.edgar_client import CikResolver, EdgarClient
+from data.edgar_client import CikResolver, EdgarClient, EdgarHTTPError
 from store.schema import COLUMNS
 
+log = logging.getLogger(__name__)
 SOURCE = "edgar"
 BUY_FIELD = "form4_buy_P"        # non-derivative open-market purchases only
 COVERAGE_FIELD = "form4_covered"
@@ -73,8 +75,19 @@ def _iter_local(root, name: str):
             yield d
 
 
+def _looks_like_form4_xml(text) -> bool:
+    """Cheap guard against non-XML responses (SEC error/HTML pages) before parsing.
+    A Form 4 ownership document always contains the ``ownershipDocument`` element."""
+    return isinstance(text, str) and "ownershipDocument" in text
+
+
 def parse_form4(xml_text: str) -> tuple[str | None, list[Form4Txn]]:
-    """Return (reporting owner CIK, transactions) from a Form 4 ownership XML."""
+    """Return (reporting owner CIK, transactions) from a Form 4 ownership XML.
+
+    Namespaces are handled explicitly: every tag is compared by its LOCAL name
+    (``_local`` strips any ``{namespace}`` prefix), so namespaced and bare Form 4
+    documents both parse. Raises ``xml.etree.ElementTree.ParseError`` on malformed
+    XML — the caller catches it per filing and quarantines that filing."""
     root = ET.fromstring(xml_text)
     owner_cik = _value(root, "rptOwnerCik")
     txns: list[Form4Txn] = []
@@ -126,10 +139,30 @@ def fetch_insider_buys(
     cik_int = int(cik)
     for accession, filing_date, primary_doc in filings:
         url = f"{_ARCHIVE}/{cik_int}/{accession.replace('-', '')}/{primary_doc}"
-        owner_cik, txns = parse_form4(client.get_text(url))
+        # Per-filing resilience: a fetch failure, a non-XML response, or malformed
+        # XML quarantines THAT filing and is skipped — a ticker's other (good)
+        # filings still ingest, and one bad filing never aborts the run.
+        def _quarantine(reason):
+            gaps.append({"ticker": ticker.upper(), "field": BUY_FIELD,
+                         "reason": f"{reason} (accession {accession})", "vendor": SOURCE})
+        try:
+            text = client.get_text(url)
+        except EdgarHTTPError as exc:
+            log.warning("form4 fetch failed %s %s: %s", ticker, accession, exc)
+            _quarantine(f"form4_fetch_failed: {exc}")
+            continue
+        if not _looks_like_form4_xml(text):
+            log.warning("form4 non-XML response for %s %s", ticker, accession)
+            _quarantine("form4_non_xml_response")
+            continue
+        try:
+            owner_cik, txns = parse_form4(text)
+        except ET.ParseError as exc:
+            log.warning("form4 parse error for %s %s: %s", ticker, accession, exc)
+            _quarantine(f"form4_parse_error: {exc}")
+            continue
         if owner_cik is None:
-            gaps.append({"ticker": ticker.upper(), "field": COVERAGE_FIELD,
-                         "reason": "form4_no_owner", "vendor": SOURCE})
+            _quarantine("form4_no_owner")
             continue
         kd = pd.Timestamp(filing_date)
         rows.append({"ticker": ticker.upper(), "field": COVERAGE_FIELD, "value": 1.0,
