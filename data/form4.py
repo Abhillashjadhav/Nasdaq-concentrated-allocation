@@ -114,6 +114,35 @@ def _form4_filings(submissions: dict):
             yield accns[i], fdates[i], docs[i]
 
 
+def _in_window(filing_date, start, end) -> bool:
+    if start is None and end is None:
+        return True
+    d = pd.Timestamp(filing_date)
+    if start is not None and d < pd.Timestamp(start):
+        return False
+    if end is not None and d > pd.Timestamp(end):
+        return False
+    return True
+
+
+def _ownership_xml_url(client, cik_int: int, accession_nodash: str) -> str | None:
+    """Resolve the RAW ownership-document XML inside a filing via its index.json.
+
+    The submissions ``primaryDocument`` for a Form 4 is the XSL-rendered view
+    (an HTML page), not the XML — fetching it returns HTML. index.json lists the
+    real files in the filing directory; the ownership XML is the ``.xml`` member
+    (preferring the modern ``primary_doc.xml`` / a form4/ownership-named file)."""
+    base = f"{_ARCHIVE}/{cik_int}/{accession_nodash}"
+    index = client.get_json(f"{base}/index.json")
+    names = [str(it.get("name", "")) for it in index.get("directory", {}).get("item", [])]
+    xmls = [n for n in names if n.lower().endswith(".xml")]
+    if not xmls:
+        return None
+    preferred = [n for n in xmls
+                 if any(k in n.lower() for k in ("primary_doc", "form4", "ownership"))]
+    return f"{base}/{(preferred or xmls)[0]}"
+
+
 def fetch_insider_buys(
     ticker: str,
     *,
@@ -121,24 +150,35 @@ def fetch_insider_buys(
     resolver: CikResolver | None = None,
     store=None,
     write: bool = False,
+    start=None,
+    end=None,
 ) -> Form4Result:
-    """Pull Form 4 open-market purchases for ``ticker`` into universal records."""
+    """Pull Form 4 open-market purchases for ``ticker`` into universal records.
+
+    Only filings whose filing date falls within ``[start, end]`` are fetched (the
+    run's date window) so we don't pull a company's entire filing history."""
     client = client or EdgarClient()
     resolver = resolver or CikResolver(client)
     cik = resolver.resolve(ticker)
 
     submissions = client.get_json(f"/submissions/CIK{cik}.json")
-    filings = list(_form4_filings(submissions))
+    all_filings = list(_form4_filings(submissions))
     gaps: list[dict] = []
-    if not filings:
+    if not all_filings:
         gaps.append({"ticker": ticker.upper(), "field": COVERAGE_FIELD,
                      "reason": "no_form4_filings", "vendor": SOURCE})
+        return Form4Result(ticker.upper(), cik, pd.DataFrame(columns=COLUMNS), gaps, 0)
+    filings = [f for f in all_filings if _in_window(f[1], start, end)]
+    if not filings:
+        gaps.append({"ticker": ticker.upper(), "field": COVERAGE_FIELD,
+                     "reason": "no_form4_filings_in_window", "vendor": SOURCE})
         return Form4Result(ticker.upper(), cik, pd.DataFrame(columns=COLUMNS), gaps, 0)
 
     rows: list[dict] = []
     cik_int = int(cik)
-    for accession, filing_date, primary_doc in filings:
-        url = f"{_ARCHIVE}/{cik_int}/{accession.replace('-', '')}/{primary_doc}"
+    n_parsed = 0
+    for accession, filing_date, _primary_doc in filings:
+        accn_nodash = accession.replace("-", "")
         # Per-filing resilience: a fetch failure, a non-XML response, or malformed
         # XML quarantines THAT filing and is skipped — a ticker's other (good)
         # filings still ingest, and one bad filing never aborts the run.
@@ -146,7 +186,11 @@ def fetch_insider_buys(
             gaps.append({"ticker": ticker.upper(), "field": BUY_FIELD,
                          "reason": f"{reason} (accession {accession})", "vendor": SOURCE})
         try:
-            text = client.get_text(url)
+            xml_url = _ownership_xml_url(client, cik_int, accn_nodash)
+            if xml_url is None:
+                _quarantine("form4_no_xml_in_filing")
+                continue
+            text = client.get_text(xml_url)
         except EdgarHTTPError as exc:
             log.warning("form4 fetch failed %s %s: %s", ticker, accession, exc)
             _quarantine(f"form4_fetch_failed: {exc}")
@@ -164,6 +208,7 @@ def fetch_insider_buys(
         if owner_cik is None:
             _quarantine("form4_no_owner")
             continue
+        n_parsed += 1
         kd = pd.Timestamp(filing_date)
         rows.append({"ticker": ticker.upper(), "field": COVERAGE_FIELD, "value": 1.0,
                      "event_date": kd, "knowledge_date": kd, "source": SOURCE})
@@ -178,6 +223,12 @@ def fetch_insider_buys(
             rows.append({"ticker": ticker.upper(), "field": f, "value": float(owner_cik),
                          "event_date": pd.Timestamp(t.date), "knowledge_date": kd,
                          "source": SOURCE})
+
+    if n_parsed == 0:
+        # Had in-window filings but parsed ZERO ownership XMLs — almost certainly an
+        # adapter/URL problem (e.g. fetching the index/HTML), not just missing data.
+        log.error("Form 4: %s had %d in-window filing(s) but parsed ZERO ownership "
+                  "XMLs — likely an adapter/URL bug, not absent data", ticker, len(filings))
 
     records = pd.DataFrame(rows, columns=COLUMNS).drop_duplicates(
         subset=["field", "event_date", "knowledge_date", "value"]
