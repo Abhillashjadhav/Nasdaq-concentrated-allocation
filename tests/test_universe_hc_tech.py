@@ -12,7 +12,7 @@ from datetime import date
 
 import pytest
 
-from data.edgar_client import CikResolver
+from data.edgar_client import CikResolver, EdgarHTTPError
 from universe.hc_tech import SIC_FIELD, classify_and_cache, nasdaq_hc_tech_universe
 from universe.sic import HEALTHCARE, TECHNOLOGY, classify_sic
 from store.store import PITStore
@@ -155,6 +155,104 @@ def test_progress_logging(tmp_path, caplog):
                            store=store, log_every=1)
     msgs = [r.getMessage() for r in caplog.records]
     assert any("classified" in m and "kept" in m and "failed" in m for m in msgs)
+
+
+# --- BUG 1: a failed/empty fetch must NOT be cached as a skip verdict ----------
+# A poisoned cache (failures written as negative verdicts) makes every later run
+# read "kept 0" straight from the store. The fix: only a genuine classification is
+# cached; a fetch that errors or returns empty stays uncached so a re-run retries.
+
+class _FailingThenGood:
+    """submissions fetch errors while ``fail`` is set; company_tickers always works."""
+
+    def __init__(self, fail):
+        self.fail = fail
+        self.calls = 0
+
+    def get_json(self, path):
+        self.calls += 1
+        if "company_tickers" in path:
+            return COMPANY_TICKERS
+        if self.fail:
+            raise EdgarHTTPError("simulated network/SSL failure")
+        for cik, data in SUBMISSIONS.items():
+            if cik in path:
+                return data
+        raise KeyError(path)
+
+
+def test_failed_fetch_is_not_cached_and_is_retried(tmp_path):
+    store = PITStore(tmp_path / "poison.sqlite")
+    # Run 1: every submissions fetch fails -> quarantined, NOTHING written to the store.
+    bad = _FailingThenGood(fail=True)
+    r1 = classify_and_cache(["TECHX"], client=bad, resolver=CikResolver(bad),
+                            store=store, sleep=lambda _s: None)
+    assert r1.n_quarantined == 1 and r1.n_classified == 0
+    assert store.get_data(SIC_FIELD, "TECHX", date(2100, 1, 1)).empty  # not cached as a skip
+
+    # Run 2: same store, fetch now works -> the ticker is RE-FETCHED, not stuck "skipped".
+    good = _FailingThenGood(fail=False)
+    r2 = classify_and_cache(["TECHX"], client=good, resolver=CikResolver(good), store=store)
+    assert good.calls > 0                       # genuinely retried, not read from a poisoned cache
+    assert r2.n_classified == 1 and r2.n_cached == 0
+    assert nasdaq_hc_tech_universe(date(2099, 1, 1), ["TECHX"], store=store) == ["TECHX"]
+
+
+def test_empty_submissions_not_cached(tmp_path):
+    """A soft-empty response (200 with no SIC/filings) is quarantined, never written
+    as a skip verdict — so it is retried on the next run rather than poisoning cache."""
+    store = PITStore(tmp_path / "empty.sqlite")
+
+    class _Empty:
+        def get_json(self, path):
+            if "company_tickers" in path:
+                return COMPANY_TICKERS
+            return {}  # no sic, no filings
+
+    e = _Empty()
+    res = classify_and_cache(["TECHX"], client=e, resolver=CikResolver(e), store=store)
+    assert res.n_quarantined == 1 and res.n_classified == 0
+    assert store.get_data(SIC_FIELD, "TECHX", date(2100, 1, 1)).empty  # retryable, not poisoned
+
+
+# --- BUG 2: a hanging EDGAR fetch must time out, count as failed, and NOT block ---
+
+def test_fetch_timeout_increments_failed_and_continues(tmp_path):
+    import threading
+    store = PITStore(tmp_path / "timeout.sqlite")
+
+    class _Hang:
+        """TECHX's submissions fetch blocks past the deadline (simulating an SSL read
+        that never returns); the rest resolve normally."""
+
+        def __init__(self):
+            self.gate = threading.Event()  # never set -> the worker thread parks
+
+        def get_json(self, path):
+            if "company_tickers" in path:
+                return COMPANY_TICKERS
+            if "0000000001" in path:        # TECHX -> hang
+                self.gate.wait(30)
+                return _subs("7372")
+            for cik, data in SUBMISSIONS.items():
+                if cik in path:
+                    return data
+            raise KeyError(path)
+
+    h = _Hang()
+    try:
+        # Tiny deadline + no retry sleeps keep the test fast; HEALX must still classify.
+        res = classify_and_cache(
+            ["TECHX", "HEALX"], client=h, resolver=CikResolver(h), store=store,
+            fetch_timeout=0.1, fetch_retries=1, sleep=lambda _s: None,
+        )
+        assert res.n_quarantined == 1                          # TECHX timed out -> failed
+        assert any(g["ticker"] == "TECHX" for g in res.quarantine)
+        assert res.n_kept == 1                                 # HEALX classified -> loop continued
+        assert nasdaq_hc_tech_universe(date(2099, 1, 1), ["TECHX", "HEALX"], store=store) == ["HEALX"]
+        assert store.get_data(SIC_FIELD, "TECHX", date(2100, 1, 1)).empty  # timeout not cached
+    finally:
+        h.gate.set()  # release the parked worker thread
 
 
 def test_progress_streams_to_stdout(tmp_path, capsys):

@@ -26,6 +26,10 @@ USER_AGENT_ENV = "STOCKSCOPE_SEC_USER_AGENT"
 MIN_INTERVAL_SECONDS = 0.125  # ~8 requests/second — under SEC's ~10/s limit, with margin
 DEFAULT_RETRIES = 3
 DEFAULT_BASE_DELAY = 1.0
+# Explicit (connect, read) timeout. A single float covers both, but a tuple makes
+# the read timeout fire reliably on a stalled SSL read instead of hanging forever.
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 30.0
 
 
 def _parse_retry_after(headers) -> float | None:
@@ -63,6 +67,8 @@ class EdgarClient:
         retries: int = DEFAULT_RETRIES,
         base_delay: float = DEFAULT_BASE_DELAY,
         min_interval: float = MIN_INTERVAL_SECONDS,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        read_timeout: float = DEFAULT_READ_TIMEOUT,
         session=None,
         sleep=time.sleep,
         clock=time.monotonic,
@@ -78,6 +84,7 @@ class EdgarClient:
         self.retries = retries
         self.base_delay = base_delay
         self.min_interval = min_interval
+        self._timeout = (connect_timeout, read_timeout)
         self._session = session or requests.Session()
         self._sleep = sleep
         self._clock = clock
@@ -101,7 +108,7 @@ class EdgarClient:
         for attempt in range(self.retries):
             self._throttle()
             try:
-                resp = self._session.get(url, headers=headers, timeout=30)
+                resp = self._session.get(url, headers=headers, timeout=self._timeout)
                 resp.raise_for_status()
                 return resp
             except Exception as exc:  # transport/HTTP (incl. 429) -> retry then fail loud
