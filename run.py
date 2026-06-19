@@ -290,6 +290,23 @@ def _signal_scorers(active_signals) -> dict:
     return {n: _make_scorer(_SIGNAL_FNS[n]) for n in active_signals if n in _SIGNAL_FNS}
 
 
+def resolve_universe_candidates(symbols, store, as_of) -> list[str]:
+    """Backtest/GO-KILL candidates from the real (survivor-limited) hc+tech
+    universe: the classified members filing as-of ``as_of`` (read point-in-time
+    from the cached SIC store). Fail loud if the cache is empty — the universe
+    must be built first (``--universe nasdaq-hc-tech --rank-asof ... --ingest``),
+    never silently run the verdict on zero names."""
+    members = nasdaq_hc_tech_universe(as_of, symbols, store=store)
+    if not members:
+        raise PipelineError(
+            "no classified hc+tech names in the store as-of "
+            f"{as_of} — build the universe first (--universe nasdaq-hc-tech "
+            "--rank-asof ... --ingest) or pass an explicit --tickers list; "
+            "refusing to emit a verdict on an empty universe"
+        )
+    return members
+
+
 @dataclass
 class RankingRun:
     results: list
@@ -345,7 +362,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # rank-as-of-date funnel
     parser.add_argument("--universe", choices=["nasdaq-hc-tech"], default=None,
-                        help="build the real Nasdaq healthcare+tech universe (ranking mode)")
+                        help="use the real Nasdaq healthcare+tech universe: with "
+                             "--rank-asof it ranks; in backtest mode (no --rank-asof) "
+                             "it runs the GO/KILL verdict on that universe")
     parser.add_argument("--rank-asof", action="append", type=date.fromisoformat, default=None,
                         metavar="YYYY-MM-DD", help="rank the universe as-of this date (repeatable)")
     parser.add_argument("--top-n", type=int, default=25, help="rows to show per ranking table")
@@ -388,16 +407,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # --- backtest mode (GO/KILL) ---------------------------------------------
-    if not args.tickers:
-        parser.error("--tickers is required unless --rank-asof is given")
+    if not args.tickers and args.universe != "nasdaq-hc-tech":
+        parser.error("backtest mode needs --tickers or --universe nasdaq-hc-tech")
+
+    store = PITStore(args.db)
+    entry_dates = [date(y, 1, 1) for y in range(args.start_year, args.end_year + 1)]
+    if args.universe == "nasdaq-hc-tech":
+        # Run the verdict on the real (survivor-limited) universe instead of a
+        # hand-typed list: resolve membership point-in-time as-of the last entry.
+        symbols = fetch_listed_symbols()
+        if args.universe_limit is not None:
+            symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
+        tickers = resolve_universe_candidates(symbols, store, max(entry_dates))
+    else:
+        tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
 
     # Only override the strict default floor when the flag is given.
     two_arm_kwargs = ({} if args.min_obs_per_slice is None
                       else {"min_obs_per_slice": args.min_obs_per_slice})
     config = RunConfig(
-        store=PITStore(args.db),
-        tickers=[t.strip() for t in args.tickers.split(",") if t.strip()],
-        entry_dates=[date(y, 1, 1) for y in range(args.start_year, args.end_year + 1)],
+        store=store,
+        tickers=tickers,
+        entry_dates=entry_dates,
         active_signals=signals,
         output_dir=args.output,
         apply_liquidity_filter=args.liquidity_filter,

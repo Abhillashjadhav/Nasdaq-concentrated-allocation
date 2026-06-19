@@ -150,6 +150,10 @@ def _caveats(results, haircut_pp) -> list[str]:
     kept = sum(wf.n_observations_kept for wf in results.values())
     years = sorted({s.year for wf in results.values() for s in wf.slices})
     return [
+        "SURVIVOR-LIMITED universe (§2.2): the free Nasdaq-Trader feed lists only "
+        "today's survivors, so delisted/merged/bankrupt names are ABSENT (the $0 "
+        "data gap). This is NOT survivorship-free; survivorship inflates win-rates "
+        "~1–4pp/yr, which the haircut below is meant to offset, not erase.",
         f"Survivorship/cost haircut of {haircut_pp:.0f}pp applied to every lift; "
         f"the reported edge is net of this conservative drag.",
         f"Significance is post-purge/embargo on de-overlapped yearly slices: "
