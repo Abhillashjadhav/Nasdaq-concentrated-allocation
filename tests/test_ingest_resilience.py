@@ -55,8 +55,11 @@ def _patch_all(monkeypatch):
 
 
 def _config(store, tickers):
+    # These tests exercise the per-ticker EDGAR fundamentals path explicitly, so
+    # pin the source (the default is now SimFin bulk).
     return RunConfig(store=store, tickers=tickers, entry_dates=[date(2019, 1, 1)],
-                     active_signals=["momentum"], output_dir="/tmp/_ingest_test", ingest=True)
+                     active_signals=["momentum"], output_dir="/tmp/_ingest_test",
+                     ingest=True, fundamentals_source="edgar")
 
 
 def test_per_ticker_failures_quarantined_good_survives(tmp_path, monkeypatch):
@@ -144,7 +147,8 @@ def test_ingest_form4_window_excludes_far_history(tmp_path, monkeypatch):
     store = PITStore(tmp_path / "f4win.sqlite")
     cfg = RunConfig(store=store, tickers=["AAA"],
                     entry_dates=[date(2019, 1, 1), date(2020, 1, 1), date(2021, 1, 1)],
-                    active_signals=["momentum"], output_dir="/tmp/_f4win", ingest=True)
+                    active_signals=["momentum"], output_dir="/tmp/_f4win", ingest=True,
+                    fundamentals_source="edgar")
     _ingest(cfg, store)
 
     s, e = pd.Timestamp(captured["start"]), pd.Timestamp(captured["end"])

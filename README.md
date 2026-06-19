@@ -45,7 +45,7 @@ Most backtests die from one of three quiet errors. Each is closed here by an aut
 
 A plain-Python `run.py` orchestrates four components. There is **no LLM in the run path** — an LLM orchestrator would add cost and non-determinism to what is fundamentally a numeric experiment. (The harness is free to run; the only judgment calls happen at design time, in code.)
 
-1. **Data-Integrity** — pulls point-in-time data from free sources (SEC EDGAR for fundamentals and Form 4 insider filings, FRED for macro, yfinance/Stooq for prices), runs fail-loud schema and coverage checks, and quarantines bad rows naming the exact ticker and field rather than dropping them silently.
+1. **Data-Integrity** — pulls point-in-time data (SimFin bulk fundamentals by default, with SEC EDGAR as a per-ticker fallback; EDGAR Form 4 for insider filings; FRED for macro; yfinance/Stooq for prices), runs fail-loud schema and coverage checks, and quarantines bad rows naming the exact ticker and field rather than dropping them silently. SimFin replaces EDGAR as the primary fundamentals source because EDGAR's per-ticker API throttles at universe scale (it left the quality signal n/a for ~1,800 names); one bulk SimFin download covers them all. This is a coverage fix, not a survivorship fix — the universe stays survivor-limited (§2.2).
 2. **Signal-Compute** — computes the locked signals deterministically. Pure, testable math, each component covered by decimal-exact golden cases.
 3. **Backtest/Stats** — labels winners (beat the Nasdaq Composite by ≥15pp over 12 months), builds the two-arm comparison, computes lift, confidence intervals, rank-IC, and walks forward year by year with purge/embargo to prevent overlapping labels from inflating significance.
 4. **Reviewer** — a PR agent that enforces every eval gate on each commit against the architecture spec.
@@ -79,4 +79,4 @@ A meaningful multi-year verdict requires, in order: a survivorship-free point-in
 
 ---
 
-*Built as a free-data ($0 cost) harness. Sources: SEC EDGAR, FRED, yfinance/Stooq. No paid data, no LLM in the run path.*
+*Sources: SimFin (bulk fundamentals; free API tier, key via `STOCKSCOPE_SIMFIN_API_KEY`), SEC EDGAR (Form 4 + fundamentals fallback), FRED, yfinance/Stooq. No LLM in the run path.*

@@ -94,6 +94,8 @@ class RunConfig:
     sector_classifier: object = None
     signals: dict[str, SignalSpec] | None = None  # defaults to DEFAULT_SIGNALS
     ingest: bool = False  # if True, call live adapters to populate the store first
+    fundamentals_source: str = "simfin"  # "simfin" (bulk) | "edgar" (per-ticker)
+    refresh_fundamentals: bool = False  # force re-download of the SimFin bulk cache
     survivorship_haircut_pp: float = 4.0
     min_consistency_years: int = 3
     min_samples_per_arm: int = 300
@@ -167,15 +169,27 @@ def _ingest(config, store) -> list[dict]:
 
     # One EDGAR client + resolver for ALL tickers, so a single throttle governs the
     # AGGREGATE request rate across the whole run (SEC rate-limits by IP, not per
-    # ticker). The resolver's company_tickers map is also fetched just once.
+    # ticker). The resolver's company_tickers map is also fetched just once. Form 4
+    # (insiders) always uses EDGAR; fundamentals default to SimFin (below).
     edgar = EdgarClient()
     resolver = CikResolver(edgar)
-    for ticker in config.tickers:
-        try:
-            fetch_fundamentals(ticker, client=edgar, resolver=resolver, store=store, write=True)
-        except edgar_errs as exc:  # delisted / transient -> quarantine, don't abort
-            quarantine.append({"ticker": ticker, "field": "fundamentals",
-                               "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
+
+    # Fundamentals source. SimFin (default) is a single bulk download that covers
+    # the whole universe, sidestepping the per-ticker SEC throttle that left quality
+    # n/a at scale. EDGAR remains available as a per-ticker fallback.
+    if config.fundamentals_source == "simfin":
+        from data.simfin_client import load_simfin_fundamentals
+        res = load_simfin_fundamentals(
+            store, refresh=config.refresh_fundamentals, tickers=config.tickers,
+        )
+        quarantine.extend(res.quarantine)  # names SimFin doesn't cover, surfaced
+    else:
+        for ticker in config.tickers:
+            try:
+                fetch_fundamentals(ticker, client=edgar, resolver=resolver, store=store, write=True)
+            except edgar_errs as exc:  # delisted / transient -> quarantine, don't abort
+                quarantine.append({"ticker": ticker, "field": "fundamentals",
+                                   "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
 
     # Form 4 needs only filings shortly before each entry (the insider lookback is
     # ~90 days), NOT the wide price window (which reaches back min_year-2 for the
@@ -355,6 +369,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="outputs", help="directory for the report")
     parser.add_argument("--liquidity-filter", action="store_true")
     parser.add_argument("--ingest", action="store_true", help="call live adapters to populate the store")
+    parser.add_argument("--fundamentals-source", choices=["simfin", "edgar"], default="simfin",
+                        help="fundamentals vendor for the quality signal (default: simfin "
+                             "bulk download; edgar = per-ticker SEC, throttled at scale)")
+    parser.add_argument("--refresh-fundamentals", action="store_true",
+                        help="force re-download of SimFin bulk data (ignore the local cache)")
     parser.add_argument(
         "--min-obs-per-slice", type=int, default=None,
         help="override the walk-forward per-slice observation floor (default ~20, "
@@ -389,7 +408,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--rank-asof requires --universe nasdaq-hc-tech")
         store = PITStore(args.db)
         config = RunConfig(store=store, tickers=[], entry_dates=list(args.rank_asof),
-                           active_signals=signals, output_dir=args.output, ingest=args.ingest)
+                           active_signals=signals, output_dir=args.output, ingest=args.ingest,
+                           fundamentals_source=args.fundamentals_source,
+                           refresh_fundamentals=args.refresh_fundamentals)
         symbols = fetch_listed_symbols()
         if args.universe_limit is not None:
             symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
@@ -434,6 +455,8 @@ def main(argv: list[str] | None = None) -> int:
         apply_liquidity_filter=args.liquidity_filter,
         ingest=args.ingest,
         two_arm_kwargs=two_arm_kwargs,
+        fundamentals_source=args.fundamentals_source,
+        refresh_fundamentals=args.refresh_fundamentals,
     )
     result = run(config)
     print(f"VERDICT: {result.report.verdict}  ->  {result.report_path}")
