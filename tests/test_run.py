@@ -167,6 +167,82 @@ def test_cli_has_min_obs_per_slice_flag():
     assert _build_parser().parse_args(["--db", "x", "--tickers", "A"]).min_obs_per_slice is None
 
 
+def _sic_row(ticker, sic, filed="2015-03-01"):
+    d = pd.Timestamp(filed)
+    return {"ticker": ticker, "field": "sic", "value": float(sic),
+            "event_date": d, "knowledge_date": d, "source": "edgar"}
+
+
+def test_resolve_universe_candidates_keeps_only_hc_tech(tmp_path):
+    # GO/KILL on the real universe: classified tech+health in, others out,
+    # resolved point-in-time from the cached SIC store.
+    from store.schema import COLUMNS
+    from store.store import PITStore
+
+    from run import resolve_universe_candidates
+
+    store = PITStore(tmp_path / "uni.sqlite")
+    store.put_data(pd.DataFrame(
+        [_sic_row("TECHX", 7372), _sic_row("HEALX", 2836), _sic_row("BANKX", 6022)],
+        columns=COLUMNS))
+    got = resolve_universe_candidates(["TECHX", "HEALX", "BANKX"], store, date(2020, 1, 1))
+    assert set(got) == {"TECHX", "HEALX"}  # BANKX (financial SIC) excluded
+
+
+def test_resolve_universe_candidates_empty_fails_loud(tmp_path):
+    from store.store import PITStore
+
+    from run import resolve_universe_candidates
+
+    store = PITStore(tmp_path / "empty.sqlite")  # no SIC cached
+    with pytest.raises(PipelineError):
+        resolve_universe_candidates(["AAA", "BBB"], store, date(2020, 1, 1))
+
+
+def test_cli_universe_mode_needs_no_tickers():
+    from run import _build_parser
+    args = _build_parser().parse_args(["--db", "x", "--universe", "nasdaq-hc-tech"])
+    assert args.universe == "nasdaq-hc-tech" and args.tickers is None
+
+
+def test_backtest_universe_mode_resolves_from_store(tmp_path, monkeypatch):
+    """main() backtest mode + --universe resolves config.tickers from the cached
+    SIC store (offline: fetch_listed_symbols and run are monkeypatched)."""
+    from types import SimpleNamespace
+
+    from store.schema import COLUMNS
+    from store.store import PITStore
+
+    import run as run_mod
+
+    db = tmp_path / "bt.sqlite"
+    PITStore(db).put_data(pd.DataFrame(
+        [_sic_row("TECHX", 7372), _sic_row("HEALX", 2836), _sic_row("BANKX", 6022)],
+        columns=COLUMNS))
+
+    monkeypatch.setattr(run_mod, "fetch_listed_symbols",
+                        lambda: ["TECHX", "HEALX", "BANKX"])
+    captured = {}
+
+    def _fake_run(config):
+        captured["tickers"] = config.tickers
+        return SimpleNamespace(
+            report=SimpleNamespace(verdict="KILL"), report_path="x", statuses={})
+
+    monkeypatch.setattr(run_mod, "run", _fake_run)
+    rc = run_mod.main(["--db", str(db), "--universe", "nasdaq-hc-tech",
+                       "--start-year", "2018", "--end-year", "2020", "--signals", "momentum"])
+    assert rc == 0
+    assert set(captured["tickers"]) == {"TECHX", "HEALX"}  # point-in-time hc+tech only
+
+
+def test_report_states_survivor_limited(tmp_path):
+    store, winners, losers = _build_store(tmp_path)
+    res = run(_config(tmp_path, store, winners, losers))
+    text = Path(res.report_path).read_text()
+    assert "SURVIVOR-LIMITED" in text and "$0 data gap" in text  # §2.2 said plainly
+
+
 def test_min_obs_per_slice_override_allows_small_slice(tmp_path):
     store, winners, losers = _build_store(tmp_path, n_win=3, n_lose=2)  # 5 obs per year
     # the strict default floor (~20) skips every small slice -> nothing evaluable
