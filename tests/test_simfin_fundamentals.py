@@ -201,6 +201,41 @@ def test_present_publish_date_still_wins():
     assert row.knowledge_date == pd.Timestamp("2021-02-15")  # the actual Publish Date
 
 
+# --- PRODUCTION MISS: SimFin's free bulk ships Publish Date as an EMPTY STRING, not
+#     NaT. pd.isna("") is False, so the PR #33 fallback never fired on the real ingest
+#     path: pd.Timestamp("") -> NaT -> rows rejected by the not-null schema -> quality
+#     n/a in production while the NaT fixture passed. Guard with real-shaped data. -----
+
+def _frames_blank_publish(ticker="LLY"):
+    """Free-tier shape: Publish Date present but blank ('' empty string)."""
+    frames = _frames_no_publish(ticker)
+    for df in frames.values():
+        df["Publish Date"] = ""  # exactly what SimFin's free bulk ships
+    return frames
+
+
+def test_blank_string_publish_date_is_recovered_on_real_path(tmp_path):
+    frames = _frames_blank_publish("LLY")
+    records, _, n_skipped = records_from_frames(frames, tickers=["LLY"])
+    assert not records.empty and n_skipped == 0
+    assert records["knowledge_date"].notna().all()                    # no NaT slipped through
+    assert (records["knowledge_date"] > records["event_date"]).all()  # no-peek safe (lagged)
+
+    store = PITStore(tmp_path / "s.sqlite")
+    store.put_data(records)                                           # raised SchemaErrors pre-fix
+    q = quality_score("LLY", date(2024, 6, 30), store=store)
+    assert not q.insufficient_data, q.reason
+    assert q.score is not None
+
+
+def test_coerce_date_treats_blank_and_unparseable_as_missing():
+    from data.simfin_client import _coerce_date
+    for missing in ("", "   ", None, pd.NaT, float("nan"), "not-a-date"):
+        assert _coerce_date(missing) is None, missing
+    assert _coerce_date("2023-02-20") == pd.Timestamp("2023-02-20")
+    assert _coerce_date(pd.Timestamp("2023-02-20")) == pd.Timestamp("2023-02-20")
+
+
 def test_filing_lag_by_period():
     from data.simfin_client import _filing_lag
     assert _filing_lag("FY") == pd.Timedelta(days=90)
