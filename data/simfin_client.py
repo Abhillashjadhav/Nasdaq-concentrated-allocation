@@ -223,7 +223,8 @@ def _download_frames(*, api_key, cache_dir, refresh, variants, tickers=None) -> 
     cache_dir.mkdir(parents=True, exist_ok=True)
     sf.set_api_key(key)
     sf.set_data_dir(str(cache_dir))
-    refresh_days = 0 if refresh else 30  # 0 -> always re-download
+    # 0 -> always re-download; 36500 -> treat cached zips as always fresh (100-yr sentinel)
+    refresh_days = 0 if refresh else 36500
 
     wanted = None if tickers is None else {str(t).upper() for t in tickers}
 
@@ -312,10 +313,10 @@ def load_universe_reference(*, api_key=None, cache_dir=DEFAULT_CACHE_DIR,
     cache_dir.mkdir(parents=True, exist_ok=True)
     sf.set_api_key(key)
     sf.set_data_dir(str(cache_dir))
-    refresh_days = 0 if refresh else 30
+    refresh_days = 0 if refresh else 36500
 
-    companies = sf.load_companies(market="us").reset_index()      # Ticker, IndustryId
-    industries = sf.load_industries().reset_index()               # IndustryId, Sector, ...
+    companies = sf.load_companies(market="us", refresh_days=refresh_days).reset_index()
+    industries = sf.load_industries(refresh_days=refresh_days).reset_index()
     ref = companies.merge(industries[[COMPANY_INDUSTRY_COL, SECTOR_COL]],
                           on=COMPANY_INDUSTRY_COL, how="left")
 
