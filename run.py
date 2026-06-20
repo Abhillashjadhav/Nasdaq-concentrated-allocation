@@ -439,6 +439,13 @@ def main(argv: list[str] | None = None) -> int:
         symbols = fetch_listed_symbols()
         if args.universe_limit is not None:
             symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
+        if args.ingest:
+            # Populate the SIC classification cache before resolving from it —
+            # an empty store has no classified names yet.
+            from data.edgar_client import CikResolver, EdgarClient
+            edgar = EdgarClient()
+            classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar),
+                               store=store, refresh=args.refresh_universe)
         tickers = resolve_universe_candidates(symbols, store, max(entry_dates))
     else:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
