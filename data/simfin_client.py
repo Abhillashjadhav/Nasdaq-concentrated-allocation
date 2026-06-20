@@ -15,6 +15,11 @@ Using Publish Date — not the period end — as the no-peek key means the store
 ``knowledge_date <= as_of`` filter keeps a period that has ended but not yet been
 published correctly invisible, so filing lag is respected (a test proves it).
 
+SimFin's FREE bulk ships Publish Date empty. When it is missing we do NOT drop the
+fact (that left quality n/a for the whole universe); instead ``knowledge_date`` =
+period end + a conservative filing lag (FY ~90d, quarter ~45d). That key is always
+strictly AFTER the period end, so no future row can leak — no-peek still holds.
+
 Network boundary
 ----------------
 The download happens HERE, at ingest, and is cached under ``.data_cache/simfin/``
