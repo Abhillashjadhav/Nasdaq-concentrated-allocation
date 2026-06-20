@@ -81,6 +81,22 @@ def _filing_lag(fiscal_period) -> pd.Timedelta:
     return _DEFAULT_LAG
 
 
+def _coerce_date(value):
+    """Parse a SimFin date cell to a ``pd.Timestamp``, or return ``None`` when it is
+    missing/blank/unparseable. SimFin's free bulk leaves Publish Date as an EMPTY
+    STRING, which ``pd.isna()`` does NOT flag and ``pd.Timestamp("")`` silently turns
+    into ``NaT`` — so a plain null-check lets the blank through and the no-peek
+    fallback never fires on real data. Coercing here is what makes the fallback work
+    on the production ingest path, not just on clean fixtures."""
+    if isinstance(value, str):
+        if value.strip() == "":
+            return None
+    elif value is None or pd.isna(value):
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(ts) else pd.Timestamp(ts)
+
+
 # target field -> (dataset, candidate SimFin columns in fallback priority order).
 # Keys MUST equal signals.quality.FIELDS (guarded by a test).
 FIELD_MAP: dict[str, tuple[str, list[str]]] = {
@@ -116,8 +132,9 @@ def records_from_frames(
     Pure and deterministic. Returns ``(records, quarantine, n_skipped)``:
       * ``records``    — a validated-shape frame (store.schema.COLUMNS)
       * ``quarantine`` — tickers requested via ``tickers`` but absent from SimFin
-      * ``n_skipped``  — facts dropped because value/Report Date/Publish Date was
-        missing (counted, never silently written as zero)
+      * ``n_skipped``  — facts dropped because the value or Report Date (period end)
+        was missing (counted, never silently written as zero). A missing Publish Date
+        is NOT skipped — it falls back to period end + filing lag.
     """
     present: set[str] = set()
     for df in frames.values():
@@ -139,21 +156,22 @@ def records_from_frames(
             tkr = str(r[TICKER_COL]).upper()
             if wanted is not None and tkr not in wanted:
                 continue
-            val, report = r.get(col), r.get(REPORT_DATE_COL)
-            if pd.isna(val) or pd.isna(report):
+            val = pd.to_numeric(r.get(col), errors="coerce")
+            report = _coerce_date(r.get(REPORT_DATE_COL))
+            if pd.isna(val) or report is None:
                 n_skipped += 1  # no value or no period end -> genuinely unusable
                 continue
-            publish = r.get(PUBLISH_DATE_COL)
-            if pd.isna(publish):
-                # Publish Date missing (free tier): derive a no-peek-safe knowledge
-                # date = period end + filing lag rather than discarding the fact.
-                knowledge = pd.Timestamp(report) + _filing_lag(r.get(FISCAL_PERIOD_COL))
+            publish = _coerce_date(r.get(PUBLISH_DATE_COL))  # None for NaN / blank / unparseable
+            if publish is None:
+                # Publish Date missing (free tier ships it blank): derive a no-peek-safe
+                # knowledge date = period end + filing lag rather than discarding the fact.
+                knowledge = report + _filing_lag(r.get(FISCAL_PERIOD_COL))
                 n_lagged += 1
             else:
-                knowledge = pd.Timestamp(publish)
+                knowledge = publish
             rows.append({
                 "ticker": tkr, "field": target_field, "value": float(val),
-                "event_date": pd.Timestamp(report),
+                "event_date": report,
                 "knowledge_date": knowledge, "source": SOURCE,
             })
     if n_lagged:
