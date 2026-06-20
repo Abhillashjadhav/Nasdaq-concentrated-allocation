@@ -97,7 +97,6 @@ def _coerce_date(value):
     return None if pd.isna(ts) else pd.Timestamp(ts)
 
 
-
 # target field -> (dataset, candidate SimFin columns in fallback priority order).
 # Keys MUST equal signals.quality.FIELDS (guarded by a test).
 FIELD_MAP: dict[str, tuple[str, list[str]]] = {
@@ -133,8 +132,9 @@ def records_from_frames(
     Pure and deterministic. Returns ``(records, quarantine, n_skipped)``:
       * ``records``    — a validated-shape frame (store.schema.COLUMNS)
       * ``quarantine`` — tickers requested via ``tickers`` but absent from SimFin
-      * ``n_skipped``  — facts dropped because value/Report Date/Publish Date was
-        missing (counted, never silently written as zero)
+      * ``n_skipped``  — facts dropped because the value or Report Date (period end)
+        was missing (counted, never silently written as zero). A missing Publish Date
+        is NOT skipped — it falls back to period end + filing lag.
     """
     present: set[str] = set()
     for df in frames.values():
