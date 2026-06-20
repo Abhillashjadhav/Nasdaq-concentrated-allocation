@@ -181,7 +181,7 @@ def records_from_frames(
     records = pd.DataFrame(rows, columns=COLUMNS)
     if not records.empty:
         # Restatements kept: distinct (period, publish, value) survive; only EXACT
-        # duplicate rows are collapsed — mirrors the EDGAR adapter.
+        # duplicate rows are collapsed.
         records = records.drop_duplicates(
             subset=["ticker", "field", "event_date", "knowledge_date", "value"]
         ).reset_index(drop=True)
@@ -194,11 +194,17 @@ def records_from_frames(
     return records, quarantine, n_skipped
 
 
-def _download_frames(*, api_key, cache_dir, refresh, variants) -> dict[str, pd.DataFrame]:
+def _download_frames(*, api_key, cache_dir, refresh, variants, tickers=None) -> dict[str, pd.DataFrame]:
     """Download (or read cached) SimFin bulk datasets via the ``simfin`` package.
 
     Network happens HERE only. ``simfin`` caches under ``cache_dir`` itself, so a
     second run re-reads the local CSVs; ``refresh=True`` forces a fresh pull.
+
+    The bulk CSVs carry ~7,000 companies; iterating every row when a run only cares
+    about a handful of universe names is what made a small run hang for tens of
+    minutes. When ``tickers`` is given we filter each frame to those rows the instant
+    it is loaded — BEFORE any concat/iteration — so the work scales with the universe
+    size, not the whole dataset. ``None`` keeps everything (a full-universe ingest).
     """
     try:
         import simfin as sf
@@ -219,11 +225,20 @@ def _download_frames(*, api_key, cache_dir, refresh, variants) -> dict[str, pd.D
     sf.set_data_dir(str(cache_dir))
     refresh_days = 0 if refresh else 30  # 0 -> always re-download
 
+    wanted = None if tickers is None else {str(t).upper() for t in tickers}
+
+    def _filter(df: pd.DataFrame) -> pd.DataFrame:
+        if wanted is None or df.empty or TICKER_COL not in df.columns:
+            return df
+        return df[df[TICKER_COL].astype(str).str.upper().isin(wanted)].copy()
+
     loaders = {"income": sf.load_income, "balance": sf.load_balance,
                "cashflow": sf.load_cashflow}
     frames: dict[str, pd.DataFrame] = {}
     for name, fn in loaders.items():
-        parts = [fn(variant=v, market="us", refresh_days=refresh_days).reset_index()
+        # Cut each variant to the target tickers the moment it is read, so the
+        # 7,000-row bulk CSV is reduced to the universe before concat/iteration.
+        parts = [_filter(fn(variant=v, market="us", refresh_days=refresh_days).reset_index())
                  for v in variants]
         frames[name] = pd.concat(parts, ignore_index=True)
     return frames
@@ -247,7 +262,10 @@ def load_simfin_fundamentals(
     is logged.
     """
     loader = frames_loader or _download_frames
-    frames = loader(api_key=api_key, cache_dir=cache_dir, refresh=refresh, variants=variants)
+    # Push the ticker filter DOWN into the loader so the bulk CSVs are cut to the
+    # universe before any row iteration (avoids the all-companies hang on a small run).
+    frames = loader(api_key=api_key, cache_dir=cache_dir, refresh=refresh,
+                    variants=variants, tickers=tickers)
 
     records, quarantine, n_skipped = records_from_frames(frames, tickers=tickers)
     n_written = store.put_data(records) if not records.empty else 0
@@ -258,3 +276,60 @@ def load_simfin_fundamentals(
     )
     return SimFinResult(n_written=n_written, n_records=len(records),
                         n_skipped=n_skipped, quarantine=quarantine)
+
+
+# SimFin company + industry reference columns (sector classification for the universe).
+COMPANY_INDUSTRY_COL = "IndustryId"
+SECTOR_COL = "Sector"
+
+
+def load_universe_reference(*, api_key=None, cache_dir=DEFAULT_CACHE_DIR,
+                            refresh: bool = False, tickers=None) -> pd.DataFrame:
+    """Return a ``[Ticker, Sector, first_report]`` reference frame from SimFin's
+    company + industry datasets, joined to each name's earliest fundamentals Report
+    Date. This is the SimFin replacement for EDGAR's SIC classification: the universe
+    builder maps ``Sector`` to technology/healthcare, and ``first_report`` is the
+    point-in-time knowledge_date (a name enters the universe only once it has
+    published financials).
+
+    Network happens HERE only (the single SimFin boundary). Offline-tested via the
+    injected loader in ``universe.hc_tech.classify_and_cache``.
+    """
+    try:
+        import simfin as sf
+    except ImportError as exc:  # setup problem, fail loud (not a per-ticker gap)
+        raise SimFinConfigError(
+            "the 'simfin' package is required for SimFin ingest (pip install simfin)"
+        ) from exc
+
+    key = (api_key or os.environ.get(API_KEY_ENV) or "").strip()
+    if not key:
+        raise SimFinConfigError(
+            f"SimFin API key required; set {API_KEY_ENV} (free key at simfin.com)"
+        )
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sf.set_api_key(key)
+    sf.set_data_dir(str(cache_dir))
+    refresh_days = 0 if refresh else 30
+
+    companies = sf.load_companies(market="us").reset_index()      # Ticker, IndustryId
+    industries = sf.load_industries().reset_index()               # IndustryId, Sector, ...
+    ref = companies.merge(industries[[COMPANY_INDUSTRY_COL, SECTOR_COL]],
+                          on=COMPANY_INDUSTRY_COL, how="left")
+
+    # Earliest Report Date per ticker (the PIT "this name became known" date).
+    inc = pd.concat(
+        [sf.load_income(variant=v, market="us", refresh_days=refresh_days).reset_index()
+         for v in ("annual", "quarterly")],
+        ignore_index=True,
+    )
+    first = (inc.groupby(TICKER_COL)[REPORT_DATE_COL].min()
+             .reset_index().rename(columns={REPORT_DATE_COL: "first_report"}))
+    ref = ref.merge(first, on=TICKER_COL, how="left")
+
+    if tickers is not None:
+        wanted = {str(t).upper() for t in tickers}
+        ref = ref[ref[TICKER_COL].astype(str).str.upper().isin(wanted)]
+    return ref[[TICKER_COL, SECTOR_COL, "first_report"]].reset_index(drop=True)

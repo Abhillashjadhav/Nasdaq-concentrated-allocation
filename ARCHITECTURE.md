@@ -51,9 +51,14 @@ Core (each independently replicated across decades):
 * **Price momentum** (12-1 month relative strength; above a rising 200-DMA;
   52-wk-high proximity)
 * **Earnings-estimate revision breadth** (net % of analysts raising)
-* **Insider cluster buying** (≥3 opportunistic buyers, non-routine)
 * **Quality / profitability** (Piotroski F-score, gross profitability) — used as
   a failure filter
+
+> **Insider cluster buying was removed.** It was sourced exclusively from SEC
+> EDGAR Form 4 filings; when EDGAR was dropped in favour of SimFin as the sole
+> fundamentals + sector vendor (no per-IP throttle), no free survivorship-clean
+> Form 4 feed remained, so the signal was retired. The live core is now momentum
+> + quality (revisions awaits its estimate-snapshot adapter).
 
 Macro gate (AND):
 
@@ -95,17 +100,18 @@ get_data(field: str, ticker: str, as_of: date) -> value | None
 * Returns only rows where `knowledge_date <= as_of`.
 * Single source of truth; every gate/signal calls it; nothing bypasses it.
 * `knowledge_date` is distinct from `event_date` (the period a datum describes).
-  Filing lags applied: 10-Q ~40d, Form 4 +2d, 13F +45d, news/estimates at
-  release timestamp.
+  Filing lags applied: fundamentals use SimFin's Publish Date, or Report Date + a
+  conservative lag (FY ~90d, quarter ~45d) when it ships blank; 13F +45d,
+  news/estimates at release timestamp.
 
 ## 7. Repo layout
 
 ```
 stockscope/
-├── data/          # source adapters (Sharadar default; EDGAR fallback)
+├── data/          # source adapters (prices; SimFin bulk fundamentals + sector)
 ├── store/         # point-in-time store + get_data() chokepoint
 ├── universe/      # survivorship-free universe + liquidity filter
-├── signals/       # momentum, revisions, insiders, quality, boosters
+├── signals/       # momentum, revisions, quality, boosters
 ├── macro/         # HY OAS, VIX, Fed-direction -> regime gate
 ├── backtest/      # walk-forward + purge/embargo runner
 ├── stats/         # two-arm lift, CIs, p-values, rank-IC
@@ -138,7 +144,7 @@ stockscope/
 4. Universe + liquidity filter
 5. Signal: momentum (+ golden case)
 6. Signal: estimate-revision breadth (+ golden case)
-7. Signal: insider cluster buys (+ golden case)
+7. ~~Signal: insider cluster buys~~ (removed with EDGAR/Form 4 — see §4)
 8. Signal: quality/profitability (+ golden case)
 9. Macro gate + regime classification (+ eval)
 10. Winner labeler (+ golden case)

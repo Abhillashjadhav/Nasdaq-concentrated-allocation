@@ -62,16 +62,16 @@ def test_render_markdown_states_it_is_not_a_win_probability():
     assert "as-of 2020-01-01" in md and "AAA" in md
 
 
-def _sic(ticker, sic, filed="2015-03-01"):
+def _sector(ticker, code, filed="2015-03-01"):
     d = pd.Timestamp(filed)
-    return {"ticker": ticker, "field": "sic", "value": float(sic),
-            "event_date": d, "knowledge_date": d, "source": "edgar"}
+    return {"ticker": ticker, "field": "sector", "value": float(code),
+            "event_date": d, "knowledge_date": d, "source": "simfin"}
 
 
 def test_run_ranking_offline(tmp_path):
     store = PITStore(tmp_path / "rank.sqlite")
-    store.put_data(pd.DataFrame([_sic("TECHX", 7372), _sic("HEALX", 2836),
-                                 _sic("BANKX", 6022)], columns=COLUMNS))
+    store.put_data(pd.DataFrame([_sector("TECHX", 1.0), _sector("HEALX", 2.0),
+                                 _sector("BANKX", 9.0)], columns=COLUMNS))
     config = RunConfig(store=store, tickers=[], entry_dates=[date(2020, 1, 1)],
                        active_signals=["x"], output_dir=str(tmp_path / "out"))
     scorers = {"x": lambda t, as_of, st: {"TECHX": 90.0, "HEALX": 70.0}.get(t)}
@@ -79,7 +79,7 @@ def test_run_ranking_offline(tmp_path):
     rr = run_ranking(config, asof_dates=[date(2020, 1, 1)], top_n=10,
                      symbols=["TECHX", "HEALX", "BANKX"], n_quarantined=3, scorers=scorers)
 
-    assert rr.coverage["n_classified"] == 2           # BANKX excluded by SIC
+    assert rr.coverage["n_classified"] == 2           # BANKX excluded (out-of-scope sector)
     assert rr.coverage["n_quarantined"] == 3
     assert [r.ticker for r in rr.results[0].rows] == ["TECHX", "HEALX"]
     assert Path(rr.report_path).exists()

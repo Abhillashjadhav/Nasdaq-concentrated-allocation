@@ -5,9 +5,9 @@ figure with event_date 2020-03-31 (period end) only becomes public on its 10-Q
 filing date 2020-05-15 (~45d later). Between those dates the value is invisible,
 even though the period has ended.
 
-Uses a fixture for the lag. Real EDGAR lag wiring (computing knowledge_date from
-the actual filing) lands with the EDGAR adapter PR; this proves the store
-honours whatever knowledge_date the ingest layer assigns.
+Uses a fixture for the lag. The real lag is applied by the SimFin adapter at
+ingest (Publish Date, or Report Date + filing lag when it ships blank); this test
+proves the store honours whatever knowledge_date the ingest layer assigns.
 """
 
 from __future__ import annotations
