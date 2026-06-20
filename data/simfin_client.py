@@ -50,6 +50,31 @@ DEFAULT_CACHE_DIR = Path(".data_cache/simfin")
 TICKER_COL = "Ticker"
 REPORT_DATE_COL = "Report Date"
 PUBLISH_DATE_COL = "Publish Date"
+FISCAL_PERIOD_COL = "Fiscal Period"
+
+# SimFin's FREE bulk datasets ship "Publish Date" (a paid-tier column) empty, while
+# "Report Date" (the fiscal period end) is always present. Rather than drop every
+# such fact — which leaves the quality signal n/a for the whole universe — we fall
+# back to a CONSERVATIVE knowledge_date = period end + a filing lag. This pushes the
+# no-peek key strictly AFTER the period closed (never before), so no future row can
+# leak (ARCHITECTURE.md §6: filing lags applied at ingest). Lags mirror SEC norms.
+_ANNUAL_LAG = pd.Timedelta(days=90)     # 10-K: filed up to ~60-90d after FY end
+_QUARTERLY_LAG = pd.Timedelta(days=45)  # 10-Q: ~40-45d after quarter end
+_DEFAULT_LAG = pd.Timedelta(days=75)    # period type unknown -> conservative middle
+
+
+def _filing_lag(fiscal_period) -> pd.Timedelta:
+    """Knowledge-date lag to apply when SimFin omits Publish Date, keyed off the
+    SimFin Fiscal Period ("FY" vs "Q1".."Q4"). Always >= the period end."""
+    if fiscal_period is None or pd.isna(fiscal_period):
+        return _DEFAULT_LAG
+    p = str(fiscal_period).strip().upper()
+    if p in ("FY", "ANNUAL", "Y"):
+        return _ANNUAL_LAG
+    if p.startswith("Q") or p in ("H1", "H2", "9M"):
+        return _QUARTERLY_LAG
+    return _DEFAULT_LAG
+
 
 # target field -> (dataset, candidate SimFin columns in fallback priority order).
 # Keys MUST equal signals.quality.FIELDS (guarded by a test).
@@ -97,6 +122,7 @@ def records_from_frames(
 
     rows: list[dict] = []
     n_skipped = 0
+    n_lagged = 0
     for target_field, (dataset_key, candidates) in FIELD_MAP.items():
         df = frames.get(dataset_key)
         if df is None or df.empty:
@@ -108,15 +134,26 @@ def records_from_frames(
             tkr = str(r[TICKER_COL]).upper()
             if wanted is not None and tkr not in wanted:
                 continue
-            val, report, publish = r.get(col), r.get(REPORT_DATE_COL), r.get(PUBLISH_DATE_COL)
-            if pd.isna(val) or pd.isna(report) or pd.isna(publish):
-                n_skipped += 1  # unusable fact (no PIT key) — counted, not silent
+            val, report = r.get(col), r.get(REPORT_DATE_COL)
+            if pd.isna(val) or pd.isna(report):
+                n_skipped += 1  # no value or no period end -> genuinely unusable
                 continue
+            publish = r.get(PUBLISH_DATE_COL)
+            if pd.isna(publish):
+                # Publish Date missing (free tier): derive a no-peek-safe knowledge
+                # date = period end + filing lag rather than discarding the fact.
+                knowledge = pd.Timestamp(report) + _filing_lag(r.get(FISCAL_PERIOD_COL))
+                n_lagged += 1
+            else:
+                knowledge = pd.Timestamp(publish)
             rows.append({
                 "ticker": tkr, "field": target_field, "value": float(val),
                 "event_date": pd.Timestamp(report),
-                "knowledge_date": pd.Timestamp(publish), "source": SOURCE,
+                "knowledge_date": knowledge, "source": SOURCE,
             })
+    if n_lagged:
+        log.info("SimFin: %d facts had no Publish Date; used Report Date + filing "
+                 "lag as a conservative knowledge_date (no-peek preserved)", n_lagged)
 
     records = pd.DataFrame(rows, columns=COLUMNS)
     if not records.empty:
