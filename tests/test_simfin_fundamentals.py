@@ -219,27 +219,22 @@ def test_tickers_are_pushed_into_the_loader(tmp_path):
 
 
 def test_download_frames_filters_each_csv_to_target_tickers(monkeypatch):
-    # Drive _download_frames with a stub `simfin` whose loaders return a 3-company
-    # frame; only the requested ticker must survive (filtered at load, pre-concat).
-    import sys
-    import types
+    # _download_frames must filter each CSV to the requested tickers at load time
+    # (before concat) so the 7,000-row bulk CSV doesn't bloat iteration for a tiny run.
+    import data.simfin_client as sc_mod
 
     big = pd.DataFrame([
         {"Ticker": "AAPL", "Report Date": "2023-12-31"},
         {"Ticker": "MSFT", "Report Date": "2023-12-31"},
-        {"Ticker": "LLY", "Report Date": "2023-12-31"},
-    ]).set_index(["Ticker", "Report Date"])
+        {"Ticker": "LLY",  "Report Date": "2023-12-31"},
+    ])
 
-    fake_sf = types.SimpleNamespace(
-        set_api_key=lambda *a, **k: None, set_data_dir=lambda *a, **k: None,
-        load_income=lambda **k: big.copy(), load_balance=lambda **k: big.copy(),
-        load_cashflow=lambda **k: big.copy(),
-    )
-    monkeypatch.setitem(sys.modules, "simfin", fake_sf)
+    monkeypatch.setattr(sc_mod, "_read_csv", lambda *a, **k: big.copy())
+    monkeypatch.setattr(sc_mod, "_ensure_dataset", lambda *a, **k: None)
 
-    from data.simfin_client import _download_frames
-    frames = _download_frames(api_key="x", cache_dir="/tmp/_sf_perf", refresh=False,
-                              variants=("annual",), tickers=["AAPL"])
+    frames = sc_mod._download_frames(api_key="x", cache_dir="/tmp/_sf_perf",
+                                     refresh=False, variants=("annual",),
+                                     tickers=["AAPL"])
     for name, df in frames.items():
         assert set(df["Ticker"]) == {"AAPL"}, name   # MSFT/LLY dropped at load time
 

@@ -22,22 +22,26 @@ strictly AFTER the period end, so no future row can leak — no-peek still holds
 
 Network boundary
 ----------------
-The download happens HERE, at ingest, and is cached under ``.data_cache/simfin/``
-(gitignored) so re-runs are a no-op unless ``refresh=True``. Parsing + loading are
-pure and offline-testable: ``records_from_frames`` takes plain DataFrames, and
-``load_simfin_fundamentals`` accepts an injected ``frames_loader`` so no network or
-``simfin`` package is needed in tests. No network ever touches signal compute.
+Downloads happen HERE only and ONLY when ``refresh=True`` or the cached file is
+absent. All subsequent reads go straight to disk (no ``simfin`` package required at
+runtime). The eight bulk zips live in ``<cache_dir>/download/`` and are extracted
+to ``<cache_dir>/`` as CSVs; a re-run with the same files is a pure offline read.
+
+Parsing is offline-testable: ``records_from_frames`` takes plain DataFrames, and
+``load_simfin_fundamentals`` accepts an injected ``frames_loader`` so no network is
+needed in tests. No network ever touches signal compute.
 
 The nine target field names match ``signals.quality.FIELDS`` so this adapter feeds
 the quality signal with no change to its math (a drift test guards the alignment).
-The API key is configuration read from ``STOCKSCOPE_SIMFIN_API_KEY`` (env only,
-never committed).
+The API key is read from ``STOCKSCOPE_SIMFIN_API_KEY`` (env only, never committed)
+and is needed ONLY when a download is triggered.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import zipfile
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
@@ -113,7 +117,7 @@ FIELD_MAP: dict[str, tuple[str, list[str]]] = {
 
 
 class SimFinConfigError(RuntimeError):
-    """Raised for setup problems (missing package or API key) — not a data gap."""
+    """Raised for setup problems (missing API key) — not a data gap."""
 
 
 @dataclass
@@ -123,6 +127,127 @@ class SimFinResult:
     n_skipped: int = 0  # facts dropped for a missing value/date (no PIT key)
     quarantine: list[dict] = dc_field(default_factory=list)  # evals.coverage shape
 
+
+# ---------------------------------------------------------------------------
+# Disk I/O helpers — no simfin package, no network
+# ---------------------------------------------------------------------------
+
+def _zip_name(dataset: str, market: str | None, variant: str | None) -> str:
+    """e.g. 'us-income-annual.zip' or 'industries.zip'"""
+    return "-".join(p for p in (market, dataset, variant) if p is not None) + ".zip"
+
+
+def _csv_name(dataset: str, market: str | None, variant: str | None) -> str:
+    return "-".join(p for p in (market, dataset, variant) if p is not None) + ".csv"
+
+
+def _read_csv(cache_dir: Path, dataset: str, market: str | None,
+              variant: str | None) -> pd.DataFrame:
+    """Read one SimFin bulk CSV from disk.  If the CSV is absent but the zip exists,
+    extract it first.  Returns an empty DataFrame when neither is present (caller
+    decides whether to abort or skip)."""
+    csv_path = cache_dir / _csv_name(dataset, market, variant)
+    if not csv_path.exists():
+        zip_path = cache_dir / "download" / _zip_name(dataset, market, variant)
+        if not zip_path.exists():
+            return pd.DataFrame()
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(cache_dir)
+    if not csv_path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(csv_path, sep=";", header=0, low_memory=False)
+
+
+# ---------------------------------------------------------------------------
+# Download helper — network only when refresh=True or files absent
+# ---------------------------------------------------------------------------
+
+_SF_BULK_URL = "https://prod.simfin.com/api/bulk-download/s3?"
+
+
+def _download_dataset(api_key: str, cache_dir: Path, dataset: str,
+                      market: str | None, variant: str | None) -> None:
+    """Download one SimFin bulk zip via the SimFin API and extract it.
+    Network happens HERE only."""
+    import requests  # local import keeps this module importable without requests installed
+
+    params = {"dataset": dataset}
+    if variant:
+        params["variant"] = variant
+    if market:
+        params["market"] = market
+    url = _SF_BULK_URL + "&".join(f"{k}={v}" for k, v in params.items())
+
+    resp = requests.get(url, headers={"Authorization": f"api-key {api_key}"},
+                        timeout=120, stream=True)
+    resp.raise_for_status()
+
+    dl_dir = cache_dir / "download"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = dl_dir / _zip_name(dataset, market, variant)
+    with open(zip_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 20):
+            f.write(chunk)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(cache_dir)
+    log.info("SimFin: downloaded and extracted %s", zip_path.name)
+
+
+def _ensure_dataset(api_key: str | None, cache_dir: Path, dataset: str,
+                    market: str | None, variant: str | None, refresh: bool) -> None:
+    """Download the dataset if refresh=True or neither CSV nor zip is present.
+    When a download is needed but no API key is set, raises SimFinConfigError."""
+    csv_path = cache_dir / _csv_name(dataset, market, variant)
+    zip_path = cache_dir / "download" / _zip_name(dataset, market, variant)
+    if not refresh and (csv_path.exists() or zip_path.exists()):
+        return  # cached — no network needed
+    key = (api_key or os.environ.get(API_KEY_ENV) or "").strip()
+    if not key:
+        raise SimFinConfigError(
+            f"SimFin data not found in cache and no API key is set. "
+            f"Run with --refresh-fundamentals after setting {API_KEY_ENV}."
+        )
+    _download_dataset(key, cache_dir, dataset, market, variant)
+
+
+# ---------------------------------------------------------------------------
+# Frame loading (injectable for tests)
+# ---------------------------------------------------------------------------
+
+def _download_frames(*, api_key, cache_dir, refresh, variants,
+                     tickers=None) -> dict[str, pd.DataFrame]:
+    """Return income/balance/cashflow DataFrames read from disk.
+
+    Downloads each dataset only when ``refresh=True`` or the file is absent.
+    Filters each frame to ``tickers`` the instant it is loaded — BEFORE concat —
+    so the 7,000-row bulk CSV is cut to the universe size, not processed in full.
+    ``None`` keeps all rows (a full-universe ingest).
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    wanted = None if tickers is None else {str(t).upper() for t in tickers}
+
+    def _filter(df: pd.DataFrame) -> pd.DataFrame:
+        if wanted is None or df.empty or TICKER_COL not in df.columns:
+            return df
+        return df[df[TICKER_COL].astype(str).str.upper().isin(wanted)].copy()
+
+    _DATASETS = {"income": "income", "balance": "balance", "cashflow": "cashflow"}
+    frames: dict[str, pd.DataFrame] = {}
+    for frame_name, dataset in _DATASETS.items():
+        parts = []
+        for v in variants:
+            _ensure_dataset(api_key, cache_dir, dataset, "us", v, refresh)
+            df = _read_csv(cache_dir, dataset, "us", v)
+            parts.append(_filter(df))
+        frames[frame_name] = pd.concat(parts, ignore_index=True)
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def records_from_frames(
     frames: dict[str, pd.DataFrame], *, tickers=None
@@ -194,57 +319,6 @@ def records_from_frames(
     return records, quarantine, n_skipped
 
 
-def _download_frames(*, api_key, cache_dir, refresh, variants, tickers=None) -> dict[str, pd.DataFrame]:
-    """Download (or read cached) SimFin bulk datasets via the ``simfin`` package.
-
-    Network happens HERE only. ``simfin`` caches under ``cache_dir`` itself, so a
-    second run re-reads the local CSVs; ``refresh=True`` forces a fresh pull.
-
-    The bulk CSVs carry ~7,000 companies; iterating every row when a run only cares
-    about a handful of universe names is what made a small run hang for tens of
-    minutes. When ``tickers`` is given we filter each frame to those rows the instant
-    it is loaded — BEFORE any concat/iteration — so the work scales with the universe
-    size, not the whole dataset. ``None`` keeps everything (a full-universe ingest).
-    """
-    try:
-        import simfin as sf
-    except ImportError as exc:  # setup problem, fail loud (not a per-ticker gap)
-        raise SimFinConfigError(
-            "the 'simfin' package is required for SimFin ingest (pip install simfin)"
-        ) from exc
-
-    key = (api_key or os.environ.get(API_KEY_ENV) or "").strip()
-    if not key:
-        raise SimFinConfigError(
-            f"SimFin API key required; set {API_KEY_ENV} (free key at simfin.com)"
-        )
-
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sf.set_api_key(key)
-    sf.set_data_dir(str(cache_dir))
-    # 0 -> always re-download; 36500 -> treat cached zips as always fresh (100-yr sentinel)
-    refresh_days = 0 if refresh else 36500
-
-    wanted = None if tickers is None else {str(t).upper() for t in tickers}
-
-    def _filter(df: pd.DataFrame) -> pd.DataFrame:
-        if wanted is None or df.empty or TICKER_COL not in df.columns:
-            return df
-        return df[df[TICKER_COL].astype(str).str.upper().isin(wanted)].copy()
-
-    loaders = {"income": sf.load_income, "balance": sf.load_balance,
-               "cashflow": sf.load_cashflow}
-    frames: dict[str, pd.DataFrame] = {}
-    for name, fn in loaders.items():
-        # Cut each variant to the target tickers the moment it is read, so the
-        # 7,000-row bulk CSV is reduced to the universe before concat/iteration.
-        parts = [_filter(fn(variant=v, market="us", refresh_days=refresh_days).reset_index())
-                 for v in variants]
-        frames[name] = pd.concat(parts, ignore_index=True)
-    return frames
-
-
 def load_simfin_fundamentals(
     store,
     *,
@@ -255,10 +329,9 @@ def load_simfin_fundamentals(
     tickers=None,
     frames_loader=None,
 ) -> SimFinResult:
-    """Download SimFin fundamentals (or read the cache) and load them into the PIT
-    store via the validated ``put_data`` chokepoint.
+    """Load SimFin fundamentals from disk (downloading if needed) into the PIT store.
 
-    ``frames_loader`` is injected in tests to bypass network/``simfin``. Tickers in
+    ``frames_loader`` is injected in tests to bypass disk/network. Tickers in
     ``tickers`` that SimFin doesn't cover are quarantined (never crash); the count
     is logged.
     """
@@ -288,47 +361,44 @@ def load_universe_reference(*, api_key=None, cache_dir=DEFAULT_CACHE_DIR,
                             refresh: bool = False, tickers=None) -> pd.DataFrame:
     """Return a ``[Ticker, Sector, first_report]`` reference frame from SimFin's
     company + industry datasets, joined to each name's earliest fundamentals Report
-    Date. This is the SimFin replacement for EDGAR's SIC classification: the universe
-    builder maps ``Sector`` to technology/healthcare, and ``first_report`` is the
-    point-in-time knowledge_date (a name enters the universe only once it has
-    published financials).
+    Date. Reads directly from disk; downloads via ``_ensure_dataset`` only when
+    ``refresh=True`` or the file is absent.
 
-    Network happens HERE only (the single SimFin boundary). Offline-tested via the
-    injected loader in ``universe.hc_tech.classify_and_cache``.
+    Offline-testable via the injected ``reference_loader`` in
+    ``universe.hc_tech.classify_and_cache``.
     """
-    try:
-        import simfin as sf
-    except ImportError as exc:  # setup problem, fail loud (not a per-ticker gap)
-        raise SimFinConfigError(
-            "the 'simfin' package is required for SimFin ingest (pip install simfin)"
-        ) from exc
-
-    key = (api_key or os.environ.get(API_KEY_ENV) or "").strip()
-    if not key:
-        raise SimFinConfigError(
-            f"SimFin API key required; set {API_KEY_ENV} (free key at simfin.com)"
-        )
-
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    sf.set_api_key(key)
-    sf.set_data_dir(str(cache_dir))
-    refresh_days = 0 if refresh else 36500
 
-    companies = sf.load_companies(market="us", refresh_days=refresh_days).reset_index()
-    industries = sf.load_industries(refresh_days=refresh_days).reset_index()
+    for ds, mkt, var in [
+        ("companies", "us", None),
+        ("industries", None, None),
+        ("income", "us", "annual"),
+        ("income", "us", "quarterly"),
+    ]:
+        _ensure_dataset(api_key, cache_dir, ds, mkt, var, refresh)
+
+    companies = _read_csv(cache_dir, "companies", "us", None)
+    industries = _read_csv(cache_dir, "industries", None, None)
+
+    if companies.empty or industries.empty:
+        return pd.DataFrame(columns=[TICKER_COL, SECTOR_COL, "first_report"])
+
     ref = companies.merge(industries[[COMPANY_INDUSTRY_COL, SECTOR_COL]],
                           on=COMPANY_INDUSTRY_COL, how="left")
 
     # Earliest Report Date per ticker (the PIT "this name became known" date).
-    inc = pd.concat(
-        [sf.load_income(variant=v, market="us", refresh_days=refresh_days).reset_index()
-         for v in ("annual", "quarterly")],
-        ignore_index=True,
-    )
-    first = (inc.groupby(TICKER_COL)[REPORT_DATE_COL].min()
-             .reset_index().rename(columns={REPORT_DATE_COL: "first_report"}))
-    ref = ref.merge(first, on=TICKER_COL, how="left")
+    inc = pd.concat([
+        _read_csv(cache_dir, "income", "us", v)
+        for v in ("annual", "quarterly")
+    ], ignore_index=True)
+
+    if not inc.empty and TICKER_COL in inc.columns and REPORT_DATE_COL in inc.columns:
+        first = (inc.groupby(TICKER_COL)[REPORT_DATE_COL].min()
+                 .reset_index().rename(columns={REPORT_DATE_COL: "first_report"}))
+        ref = ref.merge(first, on=TICKER_COL, how="left")
+    else:
+        ref["first_report"] = None
 
     if tickers is not None:
         wanted = {str(t).upper() for t in tickers}
