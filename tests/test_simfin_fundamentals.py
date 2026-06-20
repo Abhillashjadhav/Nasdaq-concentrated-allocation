@@ -135,3 +135,90 @@ def test_unusable_fact_is_skipped_not_written():
     assert n_skipped >= 1
     ni = records[records.field == "net_income"]
     assert pd.Timestamp("2020-09-30") not in set(ni.event_date)  # NaN not written
+
+
+# --- BUG: SimFin free bulk omits Publish Date -> every fact was dropped at the PIT
+#     gate, leaving quality n/a for the whole universe. Fall back to a no-peek-safe
+#     knowledge_date (period end + filing lag) instead of discarding the fact. ------
+
+def _frames_no_publish(ticker="LLY"):
+    """Two annual periods with Publish Date MISSING (free-tier shape) + Fiscal Period."""
+    def inc(report, rev, gp, ni, sh):
+        return {"Ticker": ticker, "Fiscal Period": "FY", "Report Date": report,
+                "Publish Date": None, "Revenue": rev, "Gross Profit": gp,
+                "Net Income": ni, "Shares (Diluted)": sh}
+
+    def bal(report, ta, ca, cl, ltd):
+        return {"Ticker": ticker, "Fiscal Period": "FY", "Report Date": report,
+                "Publish Date": None, "Total Assets": ta, "Total Current Assets": ca,
+                "Total Current Liabilities": cl, "Long Term Debt": ltd}
+
+    def cf(report, cfo):
+        return {"Ticker": ticker, "Fiscal Period": "FY", "Report Date": report,
+                "Publish Date": None, "Net Cash from Operating Activities": cfo}
+
+    return {
+        "income": pd.DataFrame([inc("2022-12-31", 900, 400, 100, 170),
+                                inc("2023-12-31", 1000, 480, 150, 160)]),
+        "balance": pd.DataFrame([bal("2022-12-31", 1000, 450, 200, 350),
+                                 bal("2023-12-31", 1100, 500, 200, 300)]),
+        "cashflow": pd.DataFrame([cf("2022-12-31", 180), cf("2023-12-31", 200)]),
+    }
+
+
+def test_quality_populates_when_publish_date_missing(tmp_path):
+    # The regression: with Publish Date empty the old code skipped every fact and
+    # quality came back n/a. The fallback keeps the facts, so quality scores.
+    store = PITStore(tmp_path / "s.sqlite")
+    load_simfin_fundamentals(store, frames_loader=lambda **k: _frames_no_publish("LLY"),
+                             tickers=["LLY"])
+    q = quality_score("LLY", date(2024, 6, 30), store=store)
+    assert not q.insufficient_data, q.reason
+    assert q.score is not None and q.f_score is not None
+
+
+def test_publish_date_fallback_is_no_peek_safe(tmp_path):
+    # The derived knowledge_date is period end + lag — strictly AFTER the period end
+    # — so an annual figure is invisible right after year-end and visible only later.
+    records, _, _ = records_from_frames(_frames_no_publish("LLY"))
+    fy23 = records[(records.field == "revenue")
+                   & (records.event_date == pd.Timestamp("2023-12-31"))].iloc[0]
+    assert fy23.knowledge_date == pd.Timestamp("2023-12-31") + pd.Timedelta(days=90)
+
+    store = PITStore(tmp_path / "s.sqlite")
+    store.put_data(records)
+    just_after = store.get_data("revenue", "LLY", date(2024, 1, 15))
+    assert pd.Timestamp("2023-12-31") not in set(just_after["event_date"])  # not yet "known"
+    later = store.get_data("revenue", "LLY", date(2024, 6, 30))
+    assert pd.Timestamp("2023-12-31") in set(later["event_date"])           # known after lag
+
+
+def test_present_publish_date_still_wins():
+    # The fallback fires ONLY on a missing date; a real Publish Date is untouched.
+    records, _, _ = records_from_frames(_frames())  # _frames carries real publish dates
+    row = records[(records.field == "revenue")
+                  & (records.event_date == pd.Timestamp("2020-12-31"))].iloc[0]
+    assert row.knowledge_date == pd.Timestamp("2021-02-15")  # the actual Publish Date
+
+
+def test_filing_lag_by_period():
+    from data.simfin_client import _filing_lag
+    assert _filing_lag("FY") == pd.Timedelta(days=90)
+    assert _filing_lag("Q3") == pd.Timedelta(days=45)
+    assert _filing_lag(None) == pd.Timedelta(days=75)
+    assert _filing_lag(float("nan")) == pd.Timedelta(days=75)
+
+
+def test_diagnostic_identifies_failure_modes():
+    # The diagnostic distinguishes the four failure modes on synthetic inputs, so it
+    # pinpoints (not guesses) where the SimFin->quality chain breaks on a real cache.
+    from diagnose_simfin_quality import _fixture_frames, diagnose
+
+    # publish-date skip is now fixed -> the free-tier shape scores cleanly
+    assert diagnose(_fixture_frames("LLY", publish_empty=True), "LLY") == "ok"
+    # a name absent from the frames -> ticker-key mismatch
+    assert diagnose(_fixture_frames("LLY"), "ZZZZ") == "ticker-key mismatch"
+    # a missing required column -> column-name mismatch
+    broken = _fixture_frames("LLY")
+    broken["balance"] = broken["balance"].drop(columns=["Total Assets"])
+    assert diagnose(broken, "LLY") == "column-name mismatch"
