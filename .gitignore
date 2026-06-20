@@ -25,3 +25,4 @@ data/cache/
 store/cache/
 *.parquet
 *.sqlite
+*.db
