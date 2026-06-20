@@ -85,6 +85,54 @@ def test_per_ticker_failures_quarantined_good_survives(tmp_path, monkeypatch):
     assert not any(g["ticker"] == "GOOD" for g in quarantine)
 
 
+def _blank_publish_simfin_frames(**kwargs):
+    """Real free-tier shape: SimFin bulk frames with Publish Date as an EMPTY STRING."""
+    def inc(t, rep):
+        return {"Ticker": t, "Fiscal Period": "FY", "Report Date": rep, "Publish Date": "",
+                "Revenue": 34100e6, "Gross Profit": 26900e6, "Net Income": 5240e6,
+                "Shares (Diluted)": 950e6}
+
+    def bal(t, rep):
+        return {"Ticker": t, "Fiscal Period": "FY", "Report Date": rep, "Publish Date": "",
+                "Total Assets": 64000e6, "Total Current Assets": 27000e6,
+                "Total Current Liabilities": 26000e6, "Long Term Debt": 18000e6}
+
+    def cf(t, rep):
+        return {"Ticker": t, "Fiscal Period": "FY", "Report Date": rep, "Publish Date": "",
+                "Net Cash from Operating Activities": 4240e6}
+
+    i, b, c = [], [], []
+    for t in ("LLY", "AAPL"):
+        for rep in ("2022-12-31", "2023-12-31"):
+            i.append(inc(t, rep)); b.append(bal(t, rep)); c.append(cf(t, rep))
+    return {"income": pd.DataFrame(i), "balance": pd.DataFrame(b), "cashflow": pd.DataFrame(c)}
+
+
+def test_ingest_simfin_blank_publish_populates_quality_end_to_end(tmp_path, monkeypatch):
+    """END-TO-END real-path guard: the run.py ``_ingest`` path (NOT the diagnostic, NOT
+    records_from_frames in isolation) must persist SimFin fundamentals into the store
+    even when Publish Date ships blank, so quality reads them and is not n/a. This is
+    the gap that let "diagnostic OK but ranking n/a" be possible — now covered."""
+    import data.simfin_client as simfin_mod
+    from signals.quality import quality_score
+
+    monkeypatch.setenv("STOCKSCOPE_SEC_USER_AGENT", "test test@example.com")
+    monkeypatch.setattr(prices_mod, "fetch_prices", _fake_prices)
+    monkeypatch.setattr(form4_mod, "fetch_insider_buys", lambda *a, **k: None)
+    monkeypatch.setattr(simfin_mod, "_download_frames", _blank_publish_simfin_frames)
+
+    store = PITStore(tmp_path / "e2e.sqlite")
+    cfg = RunConfig(store=store, tickers=["LLY", "AAPL"], entry_dates=[date(2024, 6, 30)],
+                    active_signals=["quality"], output_dir=str(tmp_path),
+                    ingest=True, fundamentals_source="simfin")
+    _ingest(cfg, store)  # the exact path run.py drives on --ingest
+
+    for tkr in ("LLY", "AAPL"):
+        q = quality_score(tkr, date(2024, 6, 30), store=store)
+        assert not q.insufficient_data, f"{tkr}: {q.reason}"  # populated from the real store
+        assert q.score is not None
+
+
 def test_zero_priced_tickers_is_fatal(tmp_path, monkeypatch):
     store = PITStore(tmp_path / "ing2.sqlite")
     _patch_all(monkeypatch)
