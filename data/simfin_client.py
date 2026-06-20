@@ -194,11 +194,17 @@ def records_from_frames(
     return records, quarantine, n_skipped
 
 
-def _download_frames(*, api_key, cache_dir, refresh, variants) -> dict[str, pd.DataFrame]:
+def _download_frames(*, api_key, cache_dir, refresh, variants, tickers=None) -> dict[str, pd.DataFrame]:
     """Download (or read cached) SimFin bulk datasets via the ``simfin`` package.
 
     Network happens HERE only. ``simfin`` caches under ``cache_dir`` itself, so a
     second run re-reads the local CSVs; ``refresh=True`` forces a fresh pull.
+
+    The bulk CSVs carry ~7,000 companies; iterating every row when a run only cares
+    about a handful of universe names is what made a small run hang for tens of
+    minutes. When ``tickers`` is given we filter each frame to those rows the instant
+    it is loaded — BEFORE any concat/iteration — so the work scales with the universe
+    size, not the whole dataset. ``None`` keeps everything (a full-universe ingest).
     """
     try:
         import simfin as sf
@@ -219,11 +225,20 @@ def _download_frames(*, api_key, cache_dir, refresh, variants) -> dict[str, pd.D
     sf.set_data_dir(str(cache_dir))
     refresh_days = 0 if refresh else 30  # 0 -> always re-download
 
+    wanted = None if tickers is None else {str(t).upper() for t in tickers}
+
+    def _filter(df: pd.DataFrame) -> pd.DataFrame:
+        if wanted is None or df.empty or TICKER_COL not in df.columns:
+            return df
+        return df[df[TICKER_COL].astype(str).str.upper().isin(wanted)].copy()
+
     loaders = {"income": sf.load_income, "balance": sf.load_balance,
                "cashflow": sf.load_cashflow}
     frames: dict[str, pd.DataFrame] = {}
     for name, fn in loaders.items():
-        parts = [fn(variant=v, market="us", refresh_days=refresh_days).reset_index()
+        # Cut each variant to the target tickers the moment it is read, so the
+        # 7,000-row bulk CSV is reduced to the universe before concat/iteration.
+        parts = [_filter(fn(variant=v, market="us", refresh_days=refresh_days).reset_index())
                  for v in variants]
         frames[name] = pd.concat(parts, ignore_index=True)
     return frames
@@ -247,7 +262,10 @@ def load_simfin_fundamentals(
     is logged.
     """
     loader = frames_loader or _download_frames
-    frames = loader(api_key=api_key, cache_dir=cache_dir, refresh=refresh, variants=variants)
+    # Push the ticker filter DOWN into the loader so the bulk CSVs are cut to the
+    # universe before any row iteration (avoids the all-companies hang on a small run).
+    frames = loader(api_key=api_key, cache_dir=cache_dir, refresh=refresh,
+                    variants=variants, tickers=tickers)
 
     records, quarantine, n_skipped = records_from_frames(frames, tickers=tickers)
     n_written = store.put_data(records) if not records.empty else 0

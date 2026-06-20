@@ -201,6 +201,49 @@ def test_present_publish_date_still_wins():
     assert row.knowledge_date == pd.Timestamp("2021-02-15")  # the actual Publish Date
 
 
+# --- PERFORMANCE: the bulk CSVs carry ~7,000 companies. A small run must filter to
+#     its target tickers at LOAD time, not iterate the whole dataset (which hung for
+#     tens of minutes on a single name). The ticker filter is pushed into the loader. -
+
+def test_tickers_are_pushed_into_the_loader(tmp_path):
+    seen = {}
+
+    def _spy_loader(**kwargs):
+        seen.update(kwargs)            # capture what load_simfin_fundamentals forwards
+        return _frames(("AAPL",))
+
+    store = PITStore(tmp_path / "s.sqlite")
+    load_simfin_fundamentals(store, frames_loader=_spy_loader, tickers=["AAPL", "LLY"])
+    # the loader receives the ticker list so it can cut each CSV before any iteration
+    assert seen.get("tickers") == ["AAPL", "LLY"]
+
+
+def test_download_frames_filters_each_csv_to_target_tickers(monkeypatch):
+    # Drive _download_frames with a stub `simfin` whose loaders return a 3-company
+    # frame; only the requested ticker must survive (filtered at load, pre-concat).
+    import sys
+    import types
+
+    big = pd.DataFrame([
+        {"Ticker": "AAPL", "Report Date": "2023-12-31"},
+        {"Ticker": "MSFT", "Report Date": "2023-12-31"},
+        {"Ticker": "LLY", "Report Date": "2023-12-31"},
+    ]).set_index(["Ticker", "Report Date"])
+
+    fake_sf = types.SimpleNamespace(
+        set_api_key=lambda *a, **k: None, set_data_dir=lambda *a, **k: None,
+        load_income=lambda **k: big.copy(), load_balance=lambda **k: big.copy(),
+        load_cashflow=lambda **k: big.copy(),
+    )
+    monkeypatch.setitem(sys.modules, "simfin", fake_sf)
+
+    from data.simfin_client import _download_frames
+    frames = _download_frames(api_key="x", cache_dir="/tmp/_sf_perf", refresh=False,
+                              variants=("annual",), tickers=["AAPL"])
+    for name, df in frames.items():
+        assert set(df["Ticker"]) == {"AAPL"}, name   # MSFT/LLY dropped at load time
+
+
 # --- PRODUCTION MISS: SimFin's free bulk ships Publish Date as an EMPTY STRING, not
 #     NaT. pd.isna("") is False, so the PR #33 fallback never fired on the real ingest
 #     path: pd.Timestamp("") -> NaT -> rows rejected by the not-null schema -> quality
