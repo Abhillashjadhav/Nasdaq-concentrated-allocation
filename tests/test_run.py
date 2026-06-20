@@ -89,19 +89,19 @@ def test_partial_readiness_marks_others_not_run(tmp_path):
     store, winners, losers = _build_store(tmp_path)
     cfg = _config(
         tmp_path, store, winners, losers,
-        active_signals=["quality", "revisions", "insiders"],
+        active_signals=["quality", "revisions", "estimates"],
         signals={
             "quality": SignalSpec("quality", _planted_scorer(winners), True),
             "revisions": SignalSpec("revisions", _never, False),
-            "insiders": SignalSpec("insiders", _never, False),
+            "estimates": SignalSpec("estimates", _never, False),
         },
     )
     res = run(cfg)
 
     assert res.statuses["quality"] == "evaluated"
     assert res.statuses["revisions"] == "not_run"
-    assert res.statuses["insiders"] == "not_run"
-    assert set(res.not_run) == {"revisions", "insiders"}
+    assert res.statuses["estimates"] == "not_run"
+    assert set(res.not_run) == {"revisions", "estimates"}
     assert res.report.verdict in {"GO", "MARGINAL", "KILL"}  # ran quality, didn't crash
     assert Path(res.report_path).exists()
 
@@ -147,7 +147,7 @@ def test_fail_loud_when_no_runnable_signal(tmp_path):
     cfg = RunConfig(
         store=store, tickers=winners + losers,
         entry_dates=[date(y, 1, 1) for y in YEARS],
-        active_signals=["revisions", "insiders"], output_dir=str(tmp_path / "out2"),
+        active_signals=["revisions"], output_dir=str(tmp_path / "out2"),
     )
     with pytest.raises(PipelineError):
         run(cfg)
@@ -155,9 +155,9 @@ def test_fail_loud_when_no_runnable_signal(tmp_path):
 
 def test_default_registry_adapter_availability():
     assert DEFAULT_SIGNALS["momentum"].adapter_available is True
-    assert DEFAULT_SIGNALS["quality"].adapter_available is True
+    assert DEFAULT_SIGNALS["quality"].adapter_available is True   # SimFin bulk adapter
     assert DEFAULT_SIGNALS["revisions"].adapter_available is False
-    assert DEFAULT_SIGNALS["insiders"].adapter_available is True  # Form 4 adapter (data/form4.py)
+    assert "insiders" not in DEFAULT_SIGNALS  # EDGAR/Form 4 removed -> insiders dropped
 
 
 def test_cli_has_min_obs_per_slice_flag():
@@ -167,15 +167,17 @@ def test_cli_has_min_obs_per_slice_flag():
     assert _build_parser().parse_args(["--db", "x", "--tickers", "A"]).min_obs_per_slice is None
 
 
-def _sic_row(ticker, sic, filed="2015-03-01"):
+# Sector codes the universe builder caches (1.0 technology, 2.0 healthcare); an
+# out-of-scope code stands in for a name that should not be a member.
+def _sector_row(ticker, code, filed="2015-03-01"):
     d = pd.Timestamp(filed)
-    return {"ticker": ticker, "field": "sic", "value": float(sic),
-            "event_date": d, "knowledge_date": d, "source": "edgar"}
+    return {"ticker": ticker, "field": "sector", "value": float(code),
+            "event_date": d, "knowledge_date": d, "source": "simfin"}
 
 
 def test_resolve_universe_candidates_keeps_only_hc_tech(tmp_path):
     # GO/KILL on the real universe: classified tech+health in, others out,
-    # resolved point-in-time from the cached SIC store.
+    # resolved point-in-time from the cached sector store.
     from store.schema import COLUMNS
     from store.store import PITStore
 
@@ -183,10 +185,10 @@ def test_resolve_universe_candidates_keeps_only_hc_tech(tmp_path):
 
     store = PITStore(tmp_path / "uni.sqlite")
     store.put_data(pd.DataFrame(
-        [_sic_row("TECHX", 7372), _sic_row("HEALX", 2836), _sic_row("BANKX", 6022)],
+        [_sector_row("TECHX", 1.0), _sector_row("HEALX", 2.0), _sector_row("BANKX", 9.0)],
         columns=COLUMNS))
     got = resolve_universe_candidates(["TECHX", "HEALX", "BANKX"], store, date(2020, 1, 1))
-    assert set(got) == {"TECHX", "HEALX"}  # BANKX (financial SIC) excluded
+    assert set(got) == {"TECHX", "HEALX"}  # BANKX (out-of-scope sector code) excluded
 
 
 def test_resolve_universe_candidates_empty_fails_loud(tmp_path):
@@ -194,7 +196,7 @@ def test_resolve_universe_candidates_empty_fails_loud(tmp_path):
 
     from run import resolve_universe_candidates
 
-    store = PITStore(tmp_path / "empty.sqlite")  # no SIC cached
+    store = PITStore(tmp_path / "empty.sqlite")  # no sector cached
     with pytest.raises(PipelineError):
         resolve_universe_candidates(["AAA", "BBB"], store, date(2020, 1, 1))
 
@@ -207,7 +209,7 @@ def test_cli_universe_mode_needs_no_tickers():
 
 def test_backtest_universe_mode_resolves_from_store(tmp_path, monkeypatch):
     """main() backtest mode + --universe resolves config.tickers from the cached
-    SIC store (offline: fetch_listed_symbols and run are monkeypatched)."""
+    sector store (offline: fetch_listed_symbols and run are monkeypatched)."""
     from types import SimpleNamespace
 
     from store.schema import COLUMNS
@@ -217,7 +219,7 @@ def test_backtest_universe_mode_resolves_from_store(tmp_path, monkeypatch):
 
     db = tmp_path / "bt.sqlite"
     PITStore(db).put_data(pd.DataFrame(
-        [_sic_row("TECHX", 7372), _sic_row("HEALX", 2836), _sic_row("BANKX", 6022)],
+        [_sector_row("TECHX", 1.0), _sector_row("HEALX", 2.0), _sector_row("BANKX", 9.0)],
         columns=COLUMNS))
 
     monkeypatch.setattr(run_mod, "fetch_listed_symbols",

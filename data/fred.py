@@ -14,8 +14,8 @@ lag for a series if its true release lag is larger; a too-small lag would be a
 look-ahead.
 
 The FRED API key is configuration (free), read from ``STOCKSCOPE_FRED_API_KEY``
-(or passed in); the client refuses to run if it is unset. The retry/backoff +
-throttle pattern mirrors ``data/edgar_client.py``.
+(or passed in); the client refuses to run if it is unset. It uses the same
+retry/backoff + throttle pattern as the other HTTP adapters.
 
 Missing values (FRED's ``"."`` sentinel) are skipped; a series with no usable
 observations is FLAGGED as a coverage gap, never written as zero. Field names

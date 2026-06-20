@@ -34,7 +34,6 @@ from backtest.labels import BENCHMARK_TICKER, label_winner
 from backtest.walk_forward import run_walk_forward
 from report.build_report import build_report
 from report.ranking import rank_as_of, render_ranking_markdown
-from signals.insider import insider_cluster_score
 from signals.momentum import momentum_score
 from signals.quality import quality_score
 from signals.revisions import revision_breadth_score
@@ -47,7 +46,7 @@ OBS_COLS = ["ticker", "as_of", "score", "is_winner", "excess_return"]
 _FAR_FUTURE = date(2100, 1, 1)
 _SIGNAL_FNS = {
     "momentum": momentum_score, "quality": quality_score,
-    "revisions": revision_breadth_score, "insiders": insider_cluster_score,
+    "revisions": revision_breadth_score,
 }
 
 
@@ -71,14 +70,13 @@ def _wrap(fn):
     return scorer
 
 
-# Default registry. momentum (prices adapter), quality (EDGAR adapter) and
-# insiders (Form 4 adapter, data/form4.py) have a live ingest path; revisions
-# (estimate snapshots) does not yet, so it is marked not_run until its adapter lands.
+# Default registry. momentum (prices adapter) and quality (SimFin bulk adapter)
+# have a live ingest path; revisions (estimate snapshots) does not yet, so it is
+# marked not_run until its adapter lands.
 DEFAULT_SIGNALS: dict[str, SignalSpec] = {
     "momentum": SignalSpec("momentum", _wrap(momentum_score), adapter_available=True),
     "quality": SignalSpec("quality", _wrap(quality_score), adapter_available=True),
     "revisions": SignalSpec("revisions", _wrap(revision_breadth_score), adapter_available=False),
-    "insiders": SignalSpec("insiders", _wrap(insider_cluster_score), adapter_available=True),
 }
 
 
@@ -94,7 +92,6 @@ class RunConfig:
     sector_classifier: object = None
     signals: dict[str, SignalSpec] | None = None  # defaults to DEFAULT_SIGNALS
     ingest: bool = False  # if True, call live adapters to populate the store first
-    fundamentals_source: str = "simfin"  # "simfin" (bulk) | "edgar" (per-ticker)
     refresh_fundamentals: bool = False  # force re-download of the SimFin bulk cache
     survivorship_haircut_pp: float = 4.0
     min_consistency_years: int = 3
@@ -126,20 +123,14 @@ def _ingest(config, store) -> list[dict]:
     config.ingest is True. A per-ticker price failure (e.g. a delisted name with no
     free data) is caught, recorded as a quarantined coverage gap, and skipped so the
     rest of the universe proceeds; the run fails only if NO universe ticker ingests.
-    The same per-ticker resilience applies to fundamentals and Form 4 (a delisted /
-    transient failure quarantines that ticker's data for that source, never aborts).
-    Config errors (e.g. a missing SEC User-Agent) still propagate — that is setup,
-    not a per-ticker data gap. Returns the quarantine records (evals.coverage shape)."""
+    Fundamentals come from SimFin's bulk download (one pull covers the whole
+    universe); names SimFin does not cover are quarantined, never fatal. Config
+    errors (e.g. a missing SimFin API key) still propagate — that is setup, not a
+    per-ticker data gap. Returns the quarantine records (evals.coverage shape)."""
     # Local imports keep network deps out of import time AND make the adapters
     # monkeypatchable per-call in tests (rebound from their modules each call).
-    from data.edgar_client import (  # per-ticker EDGAR errors + shared client/resolver
-        CikResolver, EdgarClient, EdgarHTTPError, UnknownTickerError,
-    )
-    from data.form4 import fetch_insider_buys
-    from data.fundamentals import fetch_fundamentals  # local import: network deps
     from data.prices import DataPullError, fetch_prices
-
-    edgar_errs = (UnknownTickerError, EdgarHTTPError)
+    from data.simfin_client import load_simfin_fundamentals
 
     start = min(config.entry_dates).replace(year=min(d.year for d in config.entry_dates) - 2)
     end = max(config.entry_dates).replace(year=max(d.year for d in config.entry_dates) + 1)
@@ -167,44 +158,13 @@ def _ingest(config, store) -> list[dict]:
         quarantine.append({"ticker": config.benchmark, "field": "close",
                            "reason": f"benchmark_price_unavailable: {exc}", "vendor": "prices"})
 
-    # One EDGAR client + resolver for ALL tickers, so a single throttle governs the
-    # AGGREGATE request rate across the whole run (SEC rate-limits by IP, not per
-    # ticker). The resolver's company_tickers map is also fetched just once. Form 4
-    # (insiders) always uses EDGAR; fundamentals default to SimFin (below).
-    edgar = EdgarClient()
-    resolver = CikResolver(edgar)
-
-    # Fundamentals source. SimFin (default) is a single bulk download that covers
-    # the whole universe, sidestepping the per-ticker SEC throttle that left quality
-    # n/a at scale. EDGAR remains available as a per-ticker fallback.
-    if config.fundamentals_source == "simfin":
-        from data.simfin_client import load_simfin_fundamentals
-        res = load_simfin_fundamentals(
-            store, refresh=config.refresh_fundamentals, tickers=config.tickers,
-        )
-        quarantine.extend(res.quarantine)  # names SimFin doesn't cover, surfaced
-    else:
-        for ticker in config.tickers:
-            try:
-                fetch_fundamentals(ticker, client=edgar, resolver=resolver, store=store, write=True)
-            except edgar_errs as exc:  # delisted / transient -> quarantine, don't abort
-                quarantine.append({"ticker": ticker, "field": "fundamentals",
-                                   "reason": f"fundamentals_unavailable: {exc}", "vendor": "edgar"})
-
-    # Form 4 needs only filings shortly before each entry (the insider lookback is
-    # ~90 days), NOT the wide price window (which reaches back min_year-2 for the
-    # momentum history). Bound it tightly so a 2019-2021 run doesn't pull 2017
-    # filings: from ~6 months before the first entry through the last entry.
-    f4_start = pd.Timestamp(min(config.entry_dates)) - pd.Timedelta(days=180)
-    f4_end = pd.Timestamp(max(config.entry_dates))
-    for ticker in config.tickers:
-        try:
-            res = fetch_insider_buys(ticker, client=edgar, resolver=resolver,
-                                     store=store, write=True, start=f4_start, end=f4_end)
-            quarantine.extend(getattr(res, "gaps", []))  # per-filing quarantines surfaced
-        except edgar_errs as exc:
-            quarantine.append({"ticker": ticker, "field": "form4_buy_P",
-                               "reason": f"form4_unavailable: {exc}", "vendor": "edgar"})
+    # Fundamentals: a single SimFin bulk download covers the whole universe,
+    # sidestepping the per-ticker throttle that left quality n/a at scale. The ticker
+    # filter is pushed into the loader so only the universe's rows are processed.
+    res = load_simfin_fundamentals(
+        store, refresh=config.refresh_fundamentals, tickers=config.tickers,
+    )
+    quarantine.extend(res.quarantine)  # names SimFin doesn't cover, surfaced
     return quarantine
 
 
@@ -306,8 +266,8 @@ def _signal_scorers(active_signals) -> dict:
 
 def resolve_universe_candidates(symbols, store, as_of) -> list[str]:
     """Backtest/GO-KILL candidates from the real (survivor-limited) hc+tech
-    universe: the classified members filing as-of ``as_of`` (read point-in-time
-    from the cached SIC store). Fail loud if the cache is empty — the universe
+    universe: the classified members reporting as-of ``as_of`` (read point-in-time
+    from the cached sector store). Fail loud if the cache is empty — the universe
     must be built first (``--universe nasdaq-hc-tech --rank-asof ... --ingest``),
     never silently run the verdict on zero names."""
     members = nasdaq_hc_tech_universe(as_of, symbols, store=store)
@@ -369,9 +329,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="outputs", help="directory for the report")
     parser.add_argument("--liquidity-filter", action="store_true")
     parser.add_argument("--ingest", action="store_true", help="call live adapters to populate the store")
-    parser.add_argument("--fundamentals-source", choices=["simfin", "edgar"], default="simfin",
-                        help="fundamentals vendor for the quality signal (default: simfin "
-                             "bulk download; edgar = per-ticker SEC, throttled at scale)")
     parser.add_argument("--refresh-fundamentals", action="store_true",
                         help="force re-download of SimFin bulk data (ignore the local cache)")
     parser.add_argument(
@@ -388,7 +345,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="YYYY-MM-DD", help="rank the universe as-of this date (repeatable)")
     parser.add_argument("--top-n", type=int, default=25, help="rows to show per ranking table")
     parser.add_argument("--refresh-universe", action="store_true",
-                        help="force re-classification of the universe (ignore cached SIC)")
+                        help="force re-classification of the universe (ignore the cached sector)")
     parser.add_argument("--universe-limit", type=int, default=None,
                         help="cap the universe size for a fast smoke test before a full run")
     return parser
@@ -409,17 +366,13 @@ def main(argv: list[str] | None = None) -> int:
         store = PITStore(args.db)
         config = RunConfig(store=store, tickers=[], entry_dates=list(args.rank_asof),
                            active_signals=signals, output_dir=args.output, ingest=args.ingest,
-                           fundamentals_source=args.fundamentals_source,
                            refresh_fundamentals=args.refresh_fundamentals)
         symbols = fetch_listed_symbols()
         if args.universe_limit is not None:
             symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
         n_quarantined = 0
         if args.ingest:
-            from data.edgar_client import CikResolver, EdgarClient
-            edgar = EdgarClient()
-            cres = classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar),
-                                      store=store, refresh=args.refresh_universe)
+            cres = classify_and_cache(symbols, store=store, refresh=args.refresh_universe)
             config.tickers = nasdaq_hc_tech_universe(max(args.rank_asof), symbols, store=store)
             n_quarantined = cres.n_quarantined + len(_ingest(config, store))
         rr = run_ranking(config, asof_dates=list(args.rank_asof), top_n=args.top_n,
@@ -440,12 +393,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.universe_limit is not None:
             symbols = symbols[:args.universe_limit]  # cap for a fast smoke test
         if args.ingest:
-            # Populate the SIC classification cache before resolving from it —
+            # Populate the sector classification cache before resolving from it —
             # an empty store has no classified names yet.
-            from data.edgar_client import CikResolver, EdgarClient
-            edgar = EdgarClient()
-            classify_and_cache(symbols, client=edgar, resolver=CikResolver(edgar),
-                               store=store, refresh=args.refresh_universe)
+            classify_and_cache(symbols, store=store, refresh=args.refresh_universe)
         tickers = resolve_universe_candidates(symbols, store, max(entry_dates))
     else:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
@@ -462,7 +412,6 @@ def main(argv: list[str] | None = None) -> int:
         apply_liquidity_filter=args.liquidity_filter,
         ingest=args.ingest,
         two_arm_kwargs=two_arm_kwargs,
-        fundamentals_source=args.fundamentals_source,
         refresh_fundamentals=args.refresh_fundamentals,
     )
     result = run(config)
