@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from report.ranking import rank_as_of, render_ranking_markdown
-from run import RunConfig, run_ranking
+from run import PipelineError, RunConfig, run_ranking
 from store.schema import COLUMNS
 from store.store import PITStore
 
@@ -84,5 +84,41 @@ def test_run_ranking_offline(tmp_path):
     assert [r.ticker for r in rr.results[0].rows] == ["TECHX", "HEALX"]
     assert Path(rr.report_path).exists()
     assert "not a win-probability" in Path(rr.report_path).read_text()
+
+
+def _close(ticker, value=100.0, on="2025-01-02"):
+    d = pd.Timestamp(on)
+    return {"ticker": ticker, "field": "close", "value": float(value),
+            "event_date": d, "knowledge_date": d, "source": "prices"}
+
+
+def test_run_ranking_all_tickers_bypasses_sector_filter(tmp_path):
+    # --all-tickers scores every name with price data, even ones that have NO sector
+    # row (the classified universe would silently drop them). Candidate enumeration is
+    # store.tickers_with_field("close"); scoring still flows through get_data(as_of).
+    store = PITStore(tmp_path / "all.sqlite")
+    store.put_data(pd.DataFrame([_close("AAA"), _close("BBB"), _close("CCC")],
+                                columns=COLUMNS))
+    # deliberately NO sector rows -> nasdaq_hc_tech_universe would return []
+    config = RunConfig(store=store, tickers=[], entry_dates=[date(2020, 1, 1)],
+                       active_signals=["x"], output_dir=str(tmp_path / "out"))
+    scorers = {"x": lambda t, as_of, st: {"AAA": 90.0, "BBB": 70.0, "CCC": 50.0}.get(t)}
+
+    rr = run_ranking(config, asof_dates=[date(2020, 1, 1)], top_n=10,
+                     symbols=[], scorers=scorers, all_tickers=True)
+
+    assert [r.ticker for r in rr.results[0].rows] == ["AAA", "BBB", "CCC"]
+    assert rr.coverage["n_priced"] == 3        # all three priced names scored
+    assert rr.coverage["n_classified"] == 3    # sector filter bypassed (not gated to 0)
+
+
+def test_run_ranking_all_tickers_fails_loud_on_empty_store(tmp_path):
+    # No price data -> fail loud rather than emit an empty ranking.
+    store = PITStore(tmp_path / "empty.sqlite")
+    config = RunConfig(store=store, tickers=[], entry_dates=[date(2020, 1, 1)],
+                       active_signals=["x"], output_dir=str(tmp_path / "out"))
+    with pytest.raises(PipelineError, match="no tickers with price data"):
+        run_ranking(config, asof_dates=[date(2020, 1, 1)], top_n=10,
+                    symbols=[], scorers={"x": lambda t, a, s: None}, all_tickers=True)
 
 

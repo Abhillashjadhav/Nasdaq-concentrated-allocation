@@ -288,22 +288,44 @@ class RankingRun:
     report_path: str
 
 
-def run_ranking(config, *, asof_dates, top_n, symbols, n_quarantined=0, scorers=None):
+def run_ranking(config, *, asof_dates, top_n, symbols, n_quarantined=0, scorers=None,
+                all_tickers=False):
     """Rank the tech+healthcare universe as-of each date and write ranking.md.
-    ``scorers`` defaults to the active signals' point-in-time scorers."""
+    ``scorers`` defaults to the active signals' point-in-time scorers.
+
+    When ``all_tickers`` is True the sector/universe filter is skipped: candidates
+    are every ticker that has price data (``field='close'``) in the store, so names
+    with fundamentals but no cached ``sector`` row are scored too. No-peek is intact
+    — each candidate is still scored through ``store.get_data(..., as_of)``."""
     store = config.store
     scorers = scorers if scorers is not None else _signal_scorers(config.active_signals)
     if not scorers:
         raise PipelineError("ranking needs at least one scorable signal in --signals")
 
+    if all_tickers:
+        priced = store.tickers_with_field("close")
+        if not priced:
+            raise PipelineError(
+                "--all-tickers: no tickers with price data (field='close') in the "
+                "store; ingest prices first or drop --all-tickers"
+            )
+        members_for = lambda ao: priced  # noqa: E731 — same candidate set per date
+        n_classified = len(priced)
+        n_priced = len(priced)
+        n_universe = len(priced)
+    else:
+        members_for = lambda ao: nasdaq_hc_tech_universe(ao, symbols, store=store)  # noqa: E731
+        classified = nasdaq_hc_tech_universe(_FAR_FUTURE, symbols, store=store)
+        n_classified = len(classified)
+        n_priced = sum(1 for s in classified if not store.get_data("close", s, _FAR_FUTURE).empty)
+        n_universe = len(symbols)
+
     results = [
-        rank_as_of(ao, nasdaq_hc_tech_universe(ao, symbols, store=store),
+        rank_as_of(ao, members_for(ao),
                    store=store, scorers=scorers, top_n=top_n, benchmark=config.benchmark)
         for ao in asof_dates
     ]
-    classified = nasdaq_hc_tech_universe(_FAR_FUTURE, symbols, store=store)
-    n_priced = sum(1 for s in classified if not store.get_data("close", s, _FAR_FUTURE).empty)
-    coverage = {"n_universe": len(symbols), "n_classified": len(classified),
+    coverage = {"n_universe": n_universe, "n_classified": n_classified,
                 "n_priced": n_priced, "n_quarantined": n_quarantined}
 
     md = render_ranking_markdown(results, coverage=coverage,
@@ -348,6 +370,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="force re-classification of the universe (ignore the cached sector)")
     parser.add_argument("--universe-limit", type=int, default=None,
                         help="cap the universe size for a fast smoke test before a full run")
+    parser.add_argument("--all-tickers", action="store_true",
+                        help="ranking mode: skip the sector/universe filter and score "
+                             "EVERY ticker with price data in the store (not just the "
+                             "classified hc+tech names)")
     return parser
 
 
@@ -361,12 +387,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- ranking mode: rank the real universe as-of date(s) ------------------
     if args.rank_asof:
-        if args.universe != "nasdaq-hc-tech":
-            parser.error("--rank-asof requires --universe nasdaq-hc-tech")
+        if not args.all_tickers and args.universe != "nasdaq-hc-tech":
+            parser.error("--rank-asof requires --universe nasdaq-hc-tech (or --all-tickers)")
         store = PITStore(args.db)
         config = RunConfig(store=store, tickers=[], entry_dates=list(args.rank_asof),
                            active_signals=signals, output_dir=args.output, ingest=args.ingest,
                            refresh_fundamentals=args.refresh_fundamentals)
+        if args.all_tickers:
+            # Score everything with price data already in the store — no universe
+            # fetch, no sector classification, no ingest gate.
+            rr = run_ranking(config, asof_dates=list(args.rank_asof), top_n=args.top_n,
+                             symbols=[], n_quarantined=0, all_tickers=True)
+            print(f"RANKING -> {rr.report_path}  (coverage: {rr.coverage})")
+            return 0
         symbols = fetch_listed_symbols()
         if args.universe_limit is not None:
             symbols = symbols[:args.universe_limit]  # cap for a fast smoke test

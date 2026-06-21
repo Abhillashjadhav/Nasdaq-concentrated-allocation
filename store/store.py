@@ -83,6 +83,19 @@ class PITStore:
             rows.to_sql(_TABLE, conn, if_exists="append", index=False)
         return len(rows)
 
+    def tickers_with_field(self, field: str) -> list[str]:
+        """Distinct tickers that have at least one record for ``field`` (any date),
+        sorted. This enumerates a CANDIDATE set (e.g. everything with prices); it is
+        NOT a point-in-time value read — scoring each candidate still flows through
+        ``get_data(..., as_of)`` and its ``knowledge_date <= as_of`` filter, so the
+        no-peek chokepoint is untouched."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT ticker FROM {_TABLE} WHERE field = ? ORDER BY ticker",
+                (field,),
+            ).fetchall()
+        return [t for (t,) in rows]
+
     def get_data(self, field: str, ticker: str, as_of) -> pd.DataFrame:
         """Return all point-in-time records for ``(field, ticker)`` that were
         public on or before ``as_of`` — i.e. ``knowledge_date <= as_of`` — newest
