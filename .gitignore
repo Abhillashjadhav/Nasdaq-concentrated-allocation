@@ -26,3 +26,6 @@ store/cache/
 *.parquet
 *.sqlite
 *.db
+
+# Generated reports / run outputs (regenerable from the harness)
+outputs/
